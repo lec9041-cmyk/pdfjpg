@@ -44,6 +44,26 @@ ORDER_LABEL_PATTERNS = [
     ),
 ]
 GENERIC_ORDER_FALLBACK = re.compile(r"\b[A-Z]{1,6}(?:[-/]\d+|\d+)(?:[-/]\d+)?\b")
+PO_CODE_PATTERN = re.compile(r"\b[A-Z0-9\-]{5,}\b")
+DISALLOWED_PO_TOKENS = {"shall", "upon", "terms", "conditions", "delivery", "acceptance"}
+COMPANY_LABEL_EXCLUDE = {"company", "supplier", "vendor", "contact person", "telephone"}
+STRICT_COMPANY_BANNED_TOKENS = {
+    "tel", "fax", "telephone", "phone", "mobile", "contact person",
+    "vendor code", "supplier code", "code:", "email", "@",
+}
+HEADER_COMPANY_EXCLUDE_TOKENS = {"buyer", "contact", "attn", "tel", "fax", "email", "@"}
+TERMS_KEYWORDS = {
+    "terms", "conditions", "delivery", "acceptance", "warranty", "liability",
+    "agreement", "payment", "shall", "upon",
+}
+CORE_FIELD_LABELS = [
+    re.compile(r"\bcompany\b", re.IGNORECASE),
+    re.compile(r"\bpo\s*number\b", re.IGNORECASE),
+    re.compile(r"\bpo\s*no\.?\b", re.IGNORECASE),
+    re.compile(r"\bp\s*/\s*o\s*no\.?\b", re.IGNORECASE),
+    re.compile(r"\bpo\s*date\b", re.IGNORECASE),
+    re.compile(r"\brelease\s*date\b", re.IGNORECASE),
+]
 SUPPORTED_EXTENSIONS = {".pdf"}
 LANDSCAPE_SIZE = (1200, 800)
 PORTRAIT_SIZE = (800, 1200)
@@ -298,6 +318,20 @@ def perform_ocr_on_document(document: fitz.Document) -> str:
     return normalize_document_text("\n".join(text_parts))
 
 
+def perform_ocr_on_top_region(page: fitz.Page) -> str:
+    if pytesseract is None:
+        return ""
+    try:
+        rect = page.rect
+        clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.4)
+        matrix = fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM)
+        pixmap = page.get_pixmap(matrix=matrix, alpha=False, clip=clip)
+        image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        return normalize_document_text(pytesseract.image_to_string(image, lang="kor+eng"))
+    except Exception:
+        return ""
+
+
 
 def is_excluded_company_name(name: str) -> bool:
     normalized = normalize_for_match(name)
@@ -336,6 +370,57 @@ def is_plausible_company_candidate(candidate: str) -> bool:
     if digit_ratio > 0.45:
         return False
     return True
+
+
+def is_valid_company_candidate_strict(candidate: str) -> bool:
+    value = clean_company_candidate(candidate)
+    if len(value) < 2 or len(value) > 70:
+        return False
+    lowered = value.lower()
+    if any(token in lowered for token in STRICT_COMPANY_BANNED_TOKENS):
+        return False
+    if re.search(r"[\w\.-]+@[\w\.-]+\.\w+", value):
+        return False
+    if re.search(r"(?:\+82|82-|031-|02-|010-)", value):
+        return False
+    if re.search(r"\b(?:zip|postal\s*code|postcode)\b", lowered):
+        return False
+    if re.search(r"\b\d{3,5}-\d{3,5}\b", value):
+        return False
+    if re.fullmatch(r"[\d\W]+", value):
+        return False
+
+    digit_ratio = sum(ch.isdigit() for ch in value) / max(len(value), 1)
+    if digit_ratio >= 0.4:
+        return False
+
+    address_markers = ["road", "street", "st.", "avenue", "building", "floor", "dong", "gu", "si", "city", "address"]
+    if len(value) >= 45 and any(marker in lowered for marker in address_markers):
+        return False
+
+    has_corp_suffix = any(token in lowered for token in [" co", " ltd", " inc", " llc", " corp", "주식회사", "㈜"])
+    has_letter_dominance = (
+        (sum(ch.isalpha() or ("가" <= ch <= "힣") for ch in value) / max(len(value), 1)) >= 0.6
+        and digit_ratio <= 0.2
+    )
+    return has_corp_suffix or has_letter_dominance
+
+
+def looks_like_person_name(candidate: str) -> bool:
+    value = clean_company_candidate(candidate)
+    if not value:
+        return False
+    words = [word for word in re.split(r"\s+", value) if word]
+    if len(words) < 2 or len(words) > 3:
+        return False
+    lowered = value.lower()
+    if any(token in lowered for token in ["co", "ltd", "inc", "corp", "llc", "주식회사", "㈜"]):
+        return False
+    alpha_only_words = [word for word in words if re.fullmatch(r"[A-Za-z][A-Za-z'.-]{1,20}", word)]
+    if len(alpha_only_words) != len(words):
+        return False
+    title_case_like = sum(1 for word in words if word[0].isupper() and word[1:].islower()) >= max(2, len(words) - 1)
+    return title_case_like
 
 
 
@@ -398,6 +483,343 @@ def collect_auto_company_candidates(full_text: str) -> List[str]:
 
     ordered = sorted(unique.values(), key=lambda item: (-item[0], len(item[1])))
     return [candidate for _score, candidate in ordered[:5]]
+
+
+def is_valid_po_number(candidate: str) -> bool:
+    raw = candidate.strip()
+    if not raw:
+        return False
+    if len(raw) < 5 or len(raw) > 20:
+        return False
+    if re.search(r"\s{3,}", raw):
+        return False
+    tokens = [token for token in raw.split() if token]
+    if len(tokens) >= 4:
+        return False
+    lowered = raw.lower()
+    if any(token in lowered for token in DISALLOWED_PO_TOKENS):
+        return False
+    punctuation_count = sum(raw.count(symbol) for symbol in [".", ",", ";", ":"])
+    if punctuation_count >= 2:
+        return False
+    lower_alpha = sum(ch.isalpha() and ch.islower() for ch in raw)
+    if lower_alpha >= 3:
+        return False
+    if len(re.findall(r"[A-Za-z]{3,}", raw)) >= 3 and len(tokens) >= 3:
+        return False
+    compact = clean_order_candidate(raw)
+    if not PO_CODE_PATTERN.fullmatch(compact):
+        return False
+    if re.search(r"\d", compact) is None:
+        return False
+    if re.search(r"[A-Z]", compact) is None and re.search(r"[0-9]", compact) is None:
+        return False
+    return True
+
+
+def extract_po_from_filename(filename_stem: str) -> List[str]:
+    normalized = filename_stem.replace("_", " ").replace(".", " ").strip()
+    candidates: List[str] = []
+    for match in re.finditer(r"[A-Z0-9\-/]{5,20}", normalized.upper()):
+        token = match.group(0).strip("-/")
+        if not token:
+            continue
+        lowered = token.lower()
+        if any(word in lowered for word in ["shall", "terms", "conditions", "order", "delivery", "acceptance"]):
+            continue
+        if is_valid_po_number(token):
+            candidates.append(clean_order_candidate(token))
+    return unique_preserve_order(candidates)
+
+
+def has_core_label(text: str) -> bool:
+    return any(pattern.search(text) for pattern in CORE_FIELD_LABELS)
+
+
+def is_terms_block(text: str) -> bool:
+    content = text.strip()
+    if not content:
+        return False
+    lowered = content.lower()
+    keyword_hits = sum(1 for keyword in TERMS_KEYWORDS if keyword in lowered)
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    english_sentence_lines = [
+        line for line in lines
+        if len(line) >= 40 and re.search(r"[A-Za-z]{4,}", line) and sum(line.count(s) for s in [".", ",", ";"]) >= 2
+    ]
+    if has_core_label(content):
+        return False
+    return len(english_sentence_lines) >= 3 and keyword_hits >= 2
+
+
+def is_terms_page(page_text: str) -> bool:
+    text = page_text.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    english_sentence_lines = [
+        line for line in lines
+        if len(line) >= 40 and re.search(r"[A-Za-z]{4,}", line) and sum(line.count(s) for s in [".", ",", ";"]) >= 2
+    ]
+    keyword_hits = sum(1 for keyword in TERMS_KEYWORDS if keyword in lowered)
+    return len(english_sentence_lines) >= 7 and keyword_hits >= 2 and not has_core_label(text)
+
+
+def _to_block_dict(block: Tuple) -> Optional[Dict[str, object]]:
+    if len(block) < 5:
+        return None
+    text = str(block[4]).strip()
+    if not text:
+        return None
+    return {
+        "x0": float(block[0]),
+        "y0": float(block[1]),
+        "x1": float(block[2]),
+        "y1": float(block[3]),
+        "text": text,
+    }
+
+
+def find_label_block(blocks: List[Dict[str, object]], label_patterns: List[re.Pattern]) -> Optional[Dict[str, object]]:
+    for block in blocks:
+        text = str(block["text"])
+        for pattern in label_patterns:
+            if pattern.search(text):
+                return block
+    return None
+
+
+def get_nearby_value(label_block: Dict[str, object], blocks: List[Dict[str, object]]) -> str:
+    lx0 = float(label_block["x0"])
+    ly0 = float(label_block["y0"])
+    lx1 = float(label_block["x1"])
+    ly1 = float(label_block["y1"])
+    line_h = max(12.0, ly1 - ly0)
+
+    def eligible_right(block: Dict[str, object]) -> bool:
+        return (
+            float(block["x0"]) >= lx1 - 3
+            and abs(float(block["y0"]) - ly0) <= line_h * 0.6
+            and float(block["x0"]) <= lx1 + 420
+        )
+
+    def eligible_down(block: Dict[str, object]) -> bool:
+        return (
+            abs(float(block["x0"]) - lx0) <= 80
+            and float(block["y0"]) > ly1 - 2
+            and float(block["y0"]) <= ly1 + line_h * 3.5
+        )
+
+    def eligible_diag(block: Dict[str, object]) -> bool:
+        return (
+            float(block["x0"]) > lx1 - 3
+            and float(block["x0"]) <= lx1 + 420
+            and float(block["y0"]) > ly1 - 2
+            and float(block["y0"]) <= ly1 + line_h * 3.5
+        )
+
+    right = [block for block in blocks if block is not label_block and eligible_right(block)]
+    if right:
+        right.sort(key=lambda block: (abs(float(block["y0"]) - ly0), float(block["x0"])))
+        return str(right[0]["text"]).strip()
+
+    down = [block for block in blocks if block is not label_block and eligible_down(block)]
+    if down:
+        down.sort(key=lambda block: (float(block["y0"]), abs(float(block["x0"]) - lx0)))
+        return str(down[0]["text"]).strip()
+
+    diag = [block for block in blocks if block is not label_block and eligible_diag(block)]
+    if diag:
+        diag.sort(key=lambda block: (float(block["y0"]), float(block["x0"])))
+        return str(diag[0]["text"]).strip()
+
+    return ""
+
+
+def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
+    rect = page.rect
+    top_limit = rect.y0 + rect.height * 0.4
+    blocks_raw = page.get_text("blocks")
+    blocks: List[Dict[str, object]] = []
+    for block in blocks_raw:
+        converted = _to_block_dict(block)
+        if converted is None:
+            continue
+        if float(converted["y0"]) > top_limit:
+            continue
+        if is_terms_block(str(converted["text"])):
+            continue
+        blocks.append(converted)
+    blocks.sort(key=lambda item: (float(item["y0"]), float(item["x0"])))
+
+    company_label_patterns = [re.compile(r"\bcompany\b", re.IGNORECASE)]
+    vendor_label_patterns = [re.compile(r"\b(?:vendor|supplier|seller|from)\b", re.IGNORECASE)]
+    buyer_label_patterns = [re.compile(r"\bbuyer\b", re.IGNORECASE)]
+    po_label_patterns = [
+        re.compile(r"\bpo\s*number\b", re.IGNORECASE),
+        re.compile(r"\bpo\s*no\.?\b", re.IGNORECASE),
+        re.compile(r"\bp\s*/\s*o\s*no\.?\b", re.IGNORECASE),
+    ]
+    date_label_patterns = [
+        re.compile(r"\bpo\s*date\b", re.IGNORECASE),
+        re.compile(r"\brelease\s*date\b", re.IGNORECASE),
+    ]
+
+    company_value = ""
+    po_candidates: List[str] = []
+    date_value = ""
+
+    def corp_token_bonus(text: str) -> int:
+        lowered = text.lower()
+        if any(token in lowered for token in [" co", " ltd", " inc", " corp", " llc", "주식회사", "㈜"]):
+            return 24
+        if re.fullmatch(r"[A-Z0-9&().,\-/\s]{4,40}", text) and sum(ch.isalpha() for ch in text) >= 3:
+            return 12
+        return 0
+
+    def evaluate_company_text(text: str, require_corp: bool = False) -> Optional[str]:
+        cleaned = clean_company_candidate(text)
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        if lowered in COMPANY_LABEL_EXCLUDE:
+            return None
+        if looks_like_person_name(cleaned):
+            return None
+        if not is_valid_company_candidate_strict(cleaned):
+            return None
+        if require_corp and corp_token_bonus(cleaned) <= 0:
+            return None
+        return cleaned
+
+    def collect_label_candidates(label_patterns: List[re.Pattern], base_score: int, require_corp: bool = False) -> List[Tuple[int, str]]:
+        label = find_label_block(blocks, label_patterns)
+        if label is None:
+            return []
+        lx0 = float(label["x0"])
+        ly0 = float(label["y0"])
+        lx1 = float(label["x1"])
+        ly1 = float(label["y1"])
+        line_h = max(12.0, ly1 - ly0)
+        nearby_pool: List[Tuple[Dict[str, object], int]] = []
+
+        right = [
+            block for block in blocks
+            if block is not label
+            and float(block["x0"]) >= lx1 - 3
+            and abs(float(block["y0"]) - ly0) <= line_h * 0.6
+            and float(block["x0"]) <= lx1 + 420
+        ]
+        right.sort(key=lambda block: (abs(float(block["y0"]) - ly0), float(block["x0"])))
+        nearby_pool.extend((block, 40) for block in right[:2])
+
+        diag = [
+            block for block in blocks
+            if block is not label
+            and float(block["x0"]) >= lx1 - 3
+            and float(block["x0"]) <= lx1 + 420
+            and float(block["y0"]) > ly1 - 2
+            and float(block["y0"]) <= ly1 + line_h * 2.6
+        ]
+        diag.sort(key=lambda block: (float(block["y0"]), float(block["x0"])))
+        nearby_pool.extend((block, 20) for block in diag[:1])
+
+        down = [
+            block for block in blocks
+            if block is not label
+            and abs(float(block["x0"]) - lx0) <= 120
+            and float(block["y0"]) > ly1 - 2
+            and float(block["y0"]) <= ly1 + line_h * 3.0
+        ]
+        down.sort(key=lambda block: (float(block["y0"]), abs(float(block["x0"]) - lx0)))
+        nearby_pool.extend((block, 10) for block in down[:2])
+
+        scored: List[Tuple[int, str]] = []
+        for block, pos_bonus in nearby_pool:
+            candidate = evaluate_company_text(str(block["text"]), require_corp=require_corp)
+            if not candidate:
+                continue
+            distance_penalty = int(abs(float(block["y0"]) - ly0) + abs(float(block["x0"]) - lx1) * 0.1)
+            score = base_score + pos_bonus + corp_token_bonus(candidate) - distance_penalty
+            scored.append((score, candidate))
+        return scored
+
+    header_y_limit = rect.y0 + rect.height * 0.30
+    header_x_limit = rect.x0 + rect.width * 0.40
+    header_blocks = [
+        block for block in blocks
+        if float(block["y0"]) <= header_y_limit
+        and float(block["x0"]) <= header_x_limit
+    ]
+    header_candidates: List[Tuple[int, str]] = []
+    for block in header_blocks:
+        text = clean_company_candidate(str(block["text"]))
+        lowered = text.lower()
+        if not text or any(token in lowered for token in HEADER_COMPANY_EXCLUDE_TOKENS):
+            continue
+        candidate = evaluate_company_text(text)
+        if not candidate:
+            continue
+        short_logo_bonus = 12 if len(candidate) <= 30 and "\n" not in str(block["text"]) else 0
+        score = 240 + corp_token_bonus(candidate) + short_logo_bonus - int(float(block["y0"]) * 0.02 + float(block["x0"]) * 0.02)
+        header_candidates.append((score, candidate))
+
+    company_candidates = collect_label_candidates(company_label_patterns, base_score=170)
+    vendor_candidates = collect_label_candidates(vendor_label_patterns, base_score=130)
+    buyer_candidates = collect_label_candidates(buyer_label_patterns, base_score=80, require_corp=True)
+
+    prioritized = [header_candidates, company_candidates, vendor_candidates, buyer_candidates]
+    for group in prioritized:
+        if not group:
+            continue
+        group.sort(key=lambda item: item[0], reverse=True)
+        company_value = group[0][1]
+        break
+
+    po_label = find_label_block(blocks, po_label_patterns)
+    if po_label is not None:
+        around = [get_nearby_value(po_label, blocks)]
+        px0 = float(po_label["x0"])
+        py0 = float(po_label["y0"])
+        py1 = float(po_label["y1"])
+        around.extend(
+            str(block["text"]).strip()
+            for block in blocks
+            if block is not po_label
+            and float(block["x0"]) >= px0 - 20
+            and float(block["x0"]) <= px0 + 520
+            and float(block["y0"]) >= py0 - 20
+            and float(block["y0"]) <= py1 + 90
+        )
+        for item in around:
+            for match in PO_CODE_PATTERN.findall(item or ""):
+                if is_valid_po_number(match):
+                    po_candidates.append(clean_order_candidate(match))
+
+    date_label = find_label_block(blocks, date_label_patterns)
+    if date_label is not None:
+        nearby = get_nearby_value(date_label, blocks)
+        if nearby:
+            for pattern in DATE_LABEL_PATTERNS:
+                match = pattern.search(f"PO Date: {nearby}")
+                if match:
+                    normalized = normalize_date(match.group(1))
+                    if normalized != MISSING_VALUE:
+                        date_value = normalized
+                        break
+            if not date_value:
+                direct = DATE_PATTERN.search(nearby)
+                if direct:
+                    normalized = normalize_date(direct.group(1))
+                    if normalized != MISSING_VALUE:
+                        date_value = normalized
+
+    return {
+        "company_name": clean_company_candidate(company_value) if company_value else "",
+        "order_numbers": unique_preserve_order([po for po in po_candidates if is_valid_po_number(po)]),
+        "document_date": date_value,
+    }
 
 
 
@@ -469,13 +891,10 @@ def extract_order_numbers(full_text: str, company_rule: Optional[CompanyRule] = 
         for pattern in ORDER_LABEL_PATTERNS:
             matches.extend(pattern.findall(full_text))
 
-    if not matches:
-        matches.extend(GENERIC_ORDER_FALLBACK.findall(full_text))
-
     cleaned: List[str] = []
     for value in matches:
         candidate = clean_order_candidate(value)
-        if len(candidate) >= 3 and re.search(r"\d", candidate):
+        if is_valid_po_number(candidate):
             cleaned.append(candidate)
 
     return unique_preserve_order(cleaned)
@@ -496,9 +915,8 @@ def collect_raw_order_candidates(full_text: str, company_rule: Optional[CompanyR
     if not raw_matches:
         for pattern in ORDER_LABEL_PATTERNS:
             raw_matches.extend(pattern.findall(full_text))
-    if not raw_matches:
-        raw_matches.extend(GENERIC_ORDER_FALLBACK.findall(full_text))
-    return unique_preserve_order([clean_order_candidate(value) for value in raw_matches if clean_order_candidate(value)])
+    cleaned = [clean_order_candidate(value) for value in raw_matches if clean_order_candidate(value)]
+    return unique_preserve_order([value for value in cleaned if is_valid_po_number(value)])
 
 
 
@@ -508,33 +926,79 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         page_count = len(document)
         used_ocr = False
 
-        company_name, matched_alias, company_source, auto_candidates = detect_company_name(full_text, company_rules, session_company_memory)
-        company_rule = next((rule for rule in company_rules if rule.display_name == company_name), None)
-        document_date = extract_document_date(full_text, pdf_path.stem)
-        raw_order_candidates = collect_raw_order_candidates(full_text, company_rule)
-        order_numbers = extract_order_numbers(full_text, company_rule)
+        first_page = document.load_page(0) if page_count else None
+        top_text = ""
+        block_result: Dict[str, object] = {"company_name": "", "order_numbers": [], "document_date": ""}
+        if first_page is not None:
+            rect = first_page.rect
+            clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.4)
+            try:
+                top_text = normalize_document_text(first_page.get_text(clip=clip))
+            except Exception:
+                top_text = ""
+            try:
+                block_result = extract_from_blocks(first_page)
+            except Exception:
+                block_result = {"company_name": "", "order_numbers": [], "document_date": ""}
 
-        needs_ocr = (
-            not full_text.strip()
-            or company_name == MISSING_VALUE
-            or document_date == MISSING_VALUE
-            or not order_numbers
-        )
+        text_mode_enough = len(re.sub(r"\s+", "", top_text)) >= 120
+        working_text = top_text if text_mode_enough else ""
+        merged_for_alias = normalize_document_text("\n".join([part for part in [top_text, full_text] if part.strip()]))
+        detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_for_alias, company_rules, session_company_memory)
+        block_company = str(block_result.get("company_name", "")).strip()
+        prefer_detected = detected_company != MISSING_VALUE and (company_source not in {"", "auto-detected"} or not block_company)
+        company_name = detected_company if prefer_detected else block_company
+        if not company_name:
+            company_name = MISSING_VALUE
+            matched_alias = ""
+            company_source = ""
 
-        if needs_ocr and configure_tesseract():
-            ocr_text = perform_ocr_on_document(document)
+        block_orders = [value for value in block_result.get("order_numbers", []) if isinstance(value, str)]
+        regex_orders = [clean_order_candidate(match.group(0)) for match in PO_CODE_PATTERN.finditer(working_text) if is_valid_po_number(match.group(0))]
+        order_numbers = unique_preserve_order([*block_orders, *regex_orders])
+        filename_orders = extract_po_from_filename(pdf_path.stem)
+        if not order_numbers and filename_orders:
+            order_numbers = filename_orders[:]
+
+        date_from_blocks = str(block_result.get("document_date", "")).strip()
+        if date_from_blocks and normalize_date(date_from_blocks) != MISSING_VALUE:
+            document_date = normalize_date(date_from_blocks)
+        else:
+            document_date = extract_document_date(working_text, pdf_path.stem)
+
+        needs_ocr = (not text_mode_enough) or company_name == MISSING_VALUE or document_date == MISSING_VALUE or not order_numbers
+
+        if needs_ocr and first_page is not None and configure_tesseract():
+            ocr_text = perform_ocr_on_top_region(first_page)
             if ocr_text.strip():
                 used_ocr = True
-                merged_text = "\n".join(part for part in [full_text, ocr_text] if part.strip())
-                full_text = normalize_document_text(merged_text)
-                company_name, matched_alias, company_source, auto_candidates = detect_company_name(full_text, company_rules, session_company_memory)
-                company_rule = next((rule for rule in company_rules if rule.display_name == company_name), None)
-                document_date = extract_document_date(full_text, pdf_path.stem)
-                raw_order_candidates = collect_raw_order_candidates(full_text, company_rule)
-                order_numbers = extract_order_numbers(full_text, company_rule)
+                merged_top_text = normalize_document_text("\n".join(part for part in [working_text, ocr_text] if part.strip()))
+                detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_top_text, company_rules, session_company_memory)
+                if company_name == MISSING_VALUE and detected_company != MISSING_VALUE:
+                    company_name = detected_company
+
+                regex_orders = [
+                    clean_order_candidate(match.group(0))
+                    for match in PO_CODE_PATTERN.finditer(merged_top_text)
+                    if is_valid_po_number(match.group(0))
+                ]
+                order_numbers = unique_preserve_order([*order_numbers, *regex_orders])
+                if not order_numbers and filename_orders:
+                    order_numbers = filename_orders[:]
+                if document_date == MISSING_VALUE:
+                    document_date = extract_document_date(merged_top_text, pdf_path.stem)
+
+        if company_name == MISSING_VALUE:
+            company_source = ""
+            matched_alias = ""
+        if not order_numbers:
+            order_numbers = [MISSING_VALUE]
+
+        raw_order_candidates = order_numbers[:]
 
     representative_order_number = order_numbers[0] if order_numbers else MISSING_VALUE
-    status = "OCR사용" if used_ocr else ("번호없음" if not order_numbers else "분석완료")
+    missing_order_only = (not order_numbers) or (len(order_numbers) == 1 and order_numbers[0] == MISSING_VALUE)
+    status = "OCR사용" if used_ocr else ("번호없음" if missing_order_only else "분석완료")
     excerpt = " ".join(full_text.split())[:160]
     company_match_status = "회사명매칭성공" if company_name != MISSING_VALUE else "회사명매칭실패"
     if company_name != MISSING_VALUE and company_source == "auto-detected":
@@ -590,6 +1054,31 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
         total_pages = len(document)
         for page_index in range(total_pages):
             page_number = page_index + 1
+            page = document.load_page(page_index)
+            page_text = ""
+            try:
+                page_text = normalize_document_text(page.get_text())
+            except Exception:
+                page_text = ""
+            should_skip_terms = (
+                page_index >= 1
+                and bool(page_text.strip())
+                and is_terms_page(page_text)
+            )
+
+            if should_skip_terms:
+                progress_callback(
+                    ProgressEvent(
+                        event_type="page",
+                        message=f"{pdf_path.name} {page_number}/{total_pages} 페이지 약관으로 판단되어 JPG 저장 생략",
+                        current_file=file_index,
+                        total_files=total_files,
+                        current_page=page_number,
+                        total_pages=total_pages,
+                    )
+                )
+                continue
+
             progress_callback(
                 ProgressEvent(
                     event_type="page",
@@ -605,7 +1094,6 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
                 )
             )
 
-            page = document.load_page(page_index)
             image = render_page_to_image(page)
             final_image = fit_image_to_canvas(image)
             output_name = f"{company_name}-{document_date}-{order_number}-{page_number}.jpg"
