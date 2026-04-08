@@ -95,7 +95,6 @@ COMPANY_STOPWORDS = {
 AUTO_COMPANY_LABEL_PATTERNS = [
     re.compile(r"(?:supplier|vendor|seller|maker|manufacturer|from)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
     re.compile(r"(?:공급자|판매자|납품처|제조사|업체명|상호)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
-    re.compile(r"(?:bill\s*to|ship\s*to|buyer|customer|consignee|수신|공급받는자|발주처)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
 ]
 CORPORATE_NAME_LINE_PATTERNS = [
     re.compile(r"([가-힣A-Za-z0-9&().,/\-\s]{2,80}(?:주식회사|㈜|Co\.?\s*,?\s*Ltd\.?|CO\.?\s*,?\s*LTD\.?|Inc\.?|LLC))", re.IGNORECASE),
@@ -390,7 +389,14 @@ def clean_company_candidate(candidate: str) -> str:
 
 
 
+def has_hard_banned_company_marker(candidate: str) -> bool:
+    lowered = candidate.lower()
+    return any(token in lowered for token in ["fax", "tel", "telephone", "phone", "mobile", "vendor code", "supplier code", "contact"])
+
+
 def is_plausible_company_candidate(candidate: str) -> bool:
+    if has_hard_banned_company_marker(candidate):
+        return False
     value = clean_company_candidate(candidate)
     if len(value) < 2 or len(value) > 80:
         return False
@@ -409,6 +415,8 @@ def is_plausible_company_candidate(candidate: str) -> bool:
 
 
 def is_valid_company_candidate_strict(candidate: str) -> bool:
+    if has_hard_banned_company_marker(candidate):
+        return False
     value = clean_company_candidate(candidate)
     if len(value) < 2 or len(value) > 70:
         return False
@@ -852,7 +860,13 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
 
     po_label = find_label_block(blocks, po_label_patterns)
     if po_label is not None:
-        around = [get_nearby_value(po_label, blocks)]
+        nearby_primary = get_nearby_value(po_label, blocks)
+        if nearby_primary:
+            for match in PO_CODE_PATTERN.findall(nearby_primary):
+                if is_valid_po_number(match):
+                    po_candidates.append(clean_order_candidate(match))
+
+        around: List[str] = []
         px0 = float(po_label["x0"])
         py0 = float(po_label["y0"])
         py1 = float(po_label["y1"])
@@ -901,16 +915,6 @@ def detect_company_name(
     company_rules: List[CompanyRule],
     session_company_memory: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str, str, List[str]]:
-    normalized_text = normalize_for_match(full_text)
-    if company_rules and normalized_text:
-        for rule in company_rules:
-            for alias in rule.all_names:
-                normalized_alias = normalize_for_match(alias)
-                if not normalized_alias or is_excluded_company_name(alias):
-                    continue
-                if normalized_alias in normalized_text:
-                    return rule.display_name, alias, rule.source, []
-
     candidates = collect_auto_company_candidates(full_text)
     if session_company_memory:
         for candidate in candidates:
@@ -918,9 +922,7 @@ def detect_company_name(
             if learned_name and not is_excluded_company_name(learned_name):
                 return learned_name, candidate, "session-memory", candidates
 
-    if candidates:
-        return candidates[0], candidates[0], "auto-detected", candidates
-    return MISSING_VALUE, "", "", []
+    return MISSING_VALUE, "", "", candidates
 
 
 def lookup_company_mapping(mapping: Dict[str, str], source_name: str) -> str:
@@ -1031,8 +1033,9 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         merged_for_alias = normalize_document_text("\n".join([part for part in [top_text, full_text] if part.strip()]))
         detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_for_alias, company_rules, session_company_memory)
         block_company = str(block_result.get("company_name", "")).strip()
-        prefer_detected = detected_company != MISSING_VALUE and (company_source not in {"", "auto-detected"} or not block_company)
-        company_name = detected_company if prefer_detected else block_company
+        company_name = block_company
+        if not company_name and detected_company != MISSING_VALUE and company_source == "session-memory":
+            company_name = detected_company
         if not company_name:
             company_name = MISSING_VALUE
             matched_alias = ""
@@ -1060,7 +1063,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                 used_ocr = True
                 merged_top_text = normalize_document_text("\n".join(part for part in [working_text, ocr_text] if part.strip()))
                 detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_top_text, company_rules, session_company_memory)
-                if company_name == MISSING_VALUE and detected_company != MISSING_VALUE:
+                if company_name == MISSING_VALUE and detected_company != MISSING_VALUE and company_source == "session-memory":
                     company_name = detected_company
 
                 merged_scan_text = normalize_document_text("\n".join(part for part in [merged_top_text, full_text] if part.strip()))
