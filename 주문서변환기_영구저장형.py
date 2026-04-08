@@ -51,6 +51,7 @@ STRICT_COMPANY_BANNED_TOKENS = {
     "tel", "fax", "telephone", "phone", "mobile", "contact person",
     "vendor code", "supplier code", "code:", "email", "@",
 }
+HEADER_COMPANY_EXCLUDE_TOKENS = {"buyer", "contact", "attn", "tel", "fax", "email", "@"}
 TERMS_KEYWORDS = {
     "terms", "conditions", "delivery", "acceptance", "warranty", "liability",
     "agreement", "payment", "shall", "upon",
@@ -405,6 +406,23 @@ def is_valid_company_candidate_strict(candidate: str) -> bool:
     return has_corp_suffix or has_letter_dominance
 
 
+def looks_like_person_name(candidate: str) -> bool:
+    value = clean_company_candidate(candidate)
+    if not value:
+        return False
+    words = [word for word in re.split(r"\s+", value) if word]
+    if len(words) < 2 or len(words) > 3:
+        return False
+    lowered = value.lower()
+    if any(token in lowered for token in ["co", "ltd", "inc", "corp", "llc", "주식회사", "㈜"]):
+        return False
+    alpha_only_words = [word for word in words if re.fullmatch(r"[A-Za-z][A-Za-z'.-]{1,20}", word)]
+    if len(alpha_only_words) != len(words):
+        return False
+    title_case_like = sum(1 for word in words if word[0].isupper() and word[1:].islower()) >= max(2, len(words) - 1)
+    return title_case_like
+
+
 
 def score_company_candidate(candidate: str, source: str = "") -> int:
     value = clean_company_candidate(candidate)
@@ -636,6 +654,8 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
     blocks.sort(key=lambda item: (float(item["y0"]), float(item["x0"])))
 
     company_label_patterns = [re.compile(r"\bcompany\b", re.IGNORECASE)]
+    vendor_label_patterns = [re.compile(r"\b(?:vendor|supplier|seller|from)\b", re.IGNORECASE)]
+    buyer_label_patterns = [re.compile(r"\bbuyer\b", re.IGNORECASE)]
     po_label_patterns = [
         re.compile(r"\bpo\s*number\b", re.IGNORECASE),
         re.compile(r"\bpo\s*no\.?\b", re.IGNORECASE),
@@ -650,70 +670,112 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
     po_candidates: List[str] = []
     date_value = ""
 
-    company_label = find_label_block(blocks, company_label_patterns)
-    if company_label is not None:
-        lx0 = float(company_label["x0"])
-        ly0 = float(company_label["y0"])
-        lx1 = float(company_label["x1"])
-        ly1 = float(company_label["y1"])
+    def corp_token_bonus(text: str) -> int:
+        lowered = text.lower()
+        if any(token in lowered for token in [" co", " ltd", " inc", " corp", " llc", "주식회사", "㈜"]):
+            return 24
+        if re.fullmatch(r"[A-Z0-9&().,\-/\s]{4,40}", text) and sum(ch.isalpha() for ch in text) >= 3:
+            return 12
+        return 0
+
+    def evaluate_company_text(text: str, require_corp: bool = False) -> Optional[str]:
+        cleaned = clean_company_candidate(text)
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        if lowered in COMPANY_LABEL_EXCLUDE:
+            return None
+        if looks_like_person_name(cleaned):
+            return None
+        if not is_valid_company_candidate_strict(cleaned):
+            return None
+        if require_corp and corp_token_bonus(cleaned) <= 0:
+            return None
+        return cleaned
+
+    def collect_label_candidates(label_patterns: List[re.Pattern], base_score: int, require_corp: bool = False) -> List[Tuple[int, str]]:
+        label = find_label_block(blocks, label_patterns)
+        if label is None:
+            return []
+        lx0 = float(label["x0"])
+        ly0 = float(label["y0"])
+        lx1 = float(label["x1"])
+        ly1 = float(label["y1"])
         line_h = max(12.0, ly1 - ly0)
+        nearby_pool: List[Tuple[Dict[str, object], int]] = []
 
-        def company_score(block: Dict[str, object], position_bonus: int) -> Optional[Tuple[int, str]]:
-            text = clean_company_candidate(str(block["text"]))
-            if not text or text.lower() in COMPANY_LABEL_EXCLUDE:
-                return None
-            if not is_valid_company_candidate_strict(text):
-                return None
-            corp_bonus = 20 if any(token in text.lower() for token in [" co", " ltd", " inc", " llc", " corp", "주식회사", "㈜"]) else 0
-            distance_penalty = int(abs(float(block["y0"]) - ly0) + abs(float(block["x0"]) - lx1) * 0.1)
-            score = 100 + position_bonus + corp_bonus - distance_penalty
-            return score, text
-
-        candidates: List[Tuple[int, str]] = []
-
-        right_blocks = [
+        right = [
             block for block in blocks
-            if block is not company_label
+            if block is not label
             and float(block["x0"]) >= lx1 - 3
             and abs(float(block["y0"]) - ly0) <= line_h * 0.6
             and float(block["x0"]) <= lx1 + 420
         ]
-        right_blocks.sort(key=lambda block: (abs(float(block["y0"]) - ly0), float(block["x0"])))
-        for block in right_blocks[:2]:
-            scored = company_score(block, 40)
-            if scored:
-                candidates.append(scored)
+        right.sort(key=lambda block: (abs(float(block["y0"]) - ly0), float(block["x0"])))
+        nearby_pool.extend((block, 40) for block in right[:2])
 
-        diag_blocks = [
+        diag = [
             block for block in blocks
-            if block is not company_label
+            if block is not label
             and float(block["x0"]) >= lx1 - 3
             and float(block["x0"]) <= lx1 + 420
             and float(block["y0"]) > ly1 - 2
             and float(block["y0"]) <= ly1 + line_h * 2.6
         ]
-        diag_blocks.sort(key=lambda block: (float(block["y0"]), float(block["x0"])))
-        for block in diag_blocks[:1]:
-            scored = company_score(block, 20)
-            if scored:
-                candidates.append(scored)
+        diag.sort(key=lambda block: (float(block["y0"]), float(block["x0"])))
+        nearby_pool.extend((block, 20) for block in diag[:1])
 
-        below_blocks = [
+        down = [
             block for block in blocks
-            if block is not company_label
+            if block is not label
             and abs(float(block["x0"]) - lx0) <= 120
             and float(block["y0"]) > ly1 - 2
             and float(block["y0"]) <= ly1 + line_h * 3.0
         ]
-        below_blocks.sort(key=lambda block: (float(block["y0"]), abs(float(block["x0"]) - lx0)))
-        for block in below_blocks[:2]:
-            scored = company_score(block, 10)
-            if scored:
-                candidates.append(scored)
+        down.sort(key=lambda block: (float(block["y0"]), abs(float(block["x0"]) - lx0)))
+        nearby_pool.extend((block, 10) for block in down[:2])
 
-        if candidates:
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            company_value = candidates[0][1]
+        scored: List[Tuple[int, str]] = []
+        for block, pos_bonus in nearby_pool:
+            candidate = evaluate_company_text(str(block["text"]), require_corp=require_corp)
+            if not candidate:
+                continue
+            distance_penalty = int(abs(float(block["y0"]) - ly0) + abs(float(block["x0"]) - lx1) * 0.1)
+            score = base_score + pos_bonus + corp_token_bonus(candidate) - distance_penalty
+            scored.append((score, candidate))
+        return scored
+
+    header_y_limit = rect.y0 + rect.height * 0.30
+    header_x_limit = rect.x0 + rect.width * 0.40
+    header_blocks = [
+        block for block in blocks
+        if float(block["y0"]) <= header_y_limit
+        and float(block["x0"]) <= header_x_limit
+    ]
+    header_candidates: List[Tuple[int, str]] = []
+    for block in header_blocks:
+        text = clean_company_candidate(str(block["text"]))
+        lowered = text.lower()
+        if not text or any(token in lowered for token in HEADER_COMPANY_EXCLUDE_TOKENS):
+            continue
+        candidate = evaluate_company_text(text)
+        if not candidate:
+            continue
+        short_logo_bonus = 12 if len(candidate) <= 30 and "\n" not in str(block["text"]) else 0
+        score = 240 + corp_token_bonus(candidate) + short_logo_bonus - int(float(block["y0"]) * 0.02 + float(block["x0"]) * 0.02)
+        header_candidates.append((score, candidate))
+
+    company_candidates = collect_label_candidates(company_label_patterns, base_score=170)
+    vendor_candidates = collect_label_candidates(vendor_label_patterns, base_score=130)
+    buyer_candidates = collect_label_candidates(buyer_label_patterns, base_score=80, require_corp=True)
+
+    prioritized = [header_candidates, company_candidates, vendor_candidates, buyer_candidates]
+    for group in prioritized:
+        if not group:
+            continue
+        group.sort(key=lambda item: item[0], reverse=True)
+        company_value = group[0][1]
+        break
 
     po_label = find_label_block(blocks, po_label_patterns)
     if po_label is not None:
