@@ -376,6 +376,8 @@ def is_valid_company_candidate_strict(candidate: str) -> bool:
     value = clean_company_candidate(candidate)
     if len(value) < 2 or len(value) > 70:
         return False
+    if is_excluded_company_name(value):
+        return False
     lowered = value.lower()
     if any(token in lowered for token in STRICT_COMPANY_BANNED_TOKENS):
         return False
@@ -508,6 +510,14 @@ def is_valid_po_number(candidate: str) -> bool:
     if len(re.findall(r"[A-Za-z]{3,}", raw)) >= 3 and len(tokens) >= 3:
         return False
     compact = clean_order_candidate(raw)
+    if re.fullmatch(r"\d{8}", compact):
+        yyyy = int(compact[:4])
+        mm = int(compact[4:6])
+        dd = int(compact[6:8])
+        if 1900 <= yyyy <= 2100 and 1 <= mm <= 12 and 1 <= dd <= 31:
+            return False
+    if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", raw) or re.fullmatch(r"\d{1,2}[-./]\d{1,2}[-./]\d{4}", raw):
+        return False
     if not PO_CODE_PATTERN.fullmatch(compact):
         return False
     if re.search(r"\d", compact) is None:
@@ -841,13 +851,25 @@ def detect_company_name(
     candidates = collect_auto_company_candidates(full_text)
     if session_company_memory:
         for candidate in candidates:
-            learned_name = session_company_memory.get(normalize_for_match(candidate), "").strip()
+            learned_name = lookup_company_mapping(session_company_memory, candidate)
             if learned_name and not is_excluded_company_name(learned_name):
                 return learned_name, candidate, "session-memory", candidates
 
     if candidates:
         return candidates[0], candidates[0], "auto-detected", candidates
     return MISSING_VALUE, "", "", []
+
+
+def lookup_company_mapping(mapping: Dict[str, str], source_name: str) -> str:
+    normalized_source = normalize_for_match(source_name)
+    if not normalized_source:
+        return ""
+    for raw_key, mapped in mapping.items():
+        if normalize_for_match(str(raw_key)) == normalized_source:
+            value = str(mapped).strip()
+            if value:
+                return value
+    return ""
 
 
 def extract_document_date(full_text: str, filename: str) -> str:
@@ -1122,6 +1144,7 @@ class PdfToJpgApp(ctk.CTk):
         self.script_dir = Path(__file__).resolve().parent
         self.companies_path = self.script_dir / "companies.txt"
         self.company_rules_csv_path = self.script_dir / "companies_rules.csv"
+        self.company_mapping_path = self.script_dir / "company_mapping.json"
         self.selected_folder: Optional[Path] = None
         self.selected_inputs: List[Path] = []
         self.worker_thread: Optional[threading.Thread] = None
@@ -1620,7 +1643,7 @@ class PdfToJpgApp(ctk.CTk):
 
     def update_memory_status(self) -> None:
         count = len(self.session_company_memory)
-        storage_text = "윈도우 내부저장" if winreg is not None else "로컬 JSON 저장"
+        storage_text = f"JSON 저장 ({self.company_mapping_path.name})"
         self.memory_status_label.configure(text=f"회사명 기억 {count}개 | {storage_text}")
 
     def remember_company_mapping(self, detected_name: str, confirmed_name: str) -> None:
@@ -1628,12 +1651,9 @@ class PdfToJpgApp(ctk.CTk):
         confirmed = confirmed_name.strip()
         if not detected or not confirmed or detected == MISSING_VALUE or confirmed == MISSING_VALUE:
             return
-        key = normalize_for_match(detected)
-        if not key:
-            return
         if is_excluded_company_name(detected) or is_excluded_company_name(confirmed):
             return
-        self.session_company_memory[key] = confirmed
+        self.session_company_memory[detected] = confirmed
         self.save_persistent_company_memory()
         self.update_memory_status()
         self.append_log(f"[기억] {detected} -> {confirmed}")
@@ -1668,12 +1688,12 @@ class PdfToJpgApp(ctk.CTk):
                 skipped += 1
                 continue
             key, value = line.split("=", 1)
-            normalized_key = normalize_for_match(key)
+            raw_key = key.strip()
             company_name = value.strip()
-            if not normalized_key or not company_name or is_excluded_company_name(company_name):
+            if not raw_key or not company_name or is_excluded_company_name(company_name):
                 skipped += 1
                 continue
-            self.session_company_memory[normalized_key] = company_name
+            self.session_company_memory[raw_key] = company_name
             added += 1
         self.save_persistent_company_memory()
         self.update_memory_status()
@@ -1721,60 +1741,25 @@ class PdfToJpgApp(ctk.CTk):
             row=0, column=1, padx=(8, 0), sticky="ew"
         )
 
-    def get_fallback_memory_path(self) -> Path:
-        appdata = Path.home() / "AppData" / "Local" / "OrderConverterStudio"
-        appdata.mkdir(parents=True, exist_ok=True)
-        return appdata / "company_alias_memory.json"
-
     def load_persistent_company_memory(self) -> Dict[str, str]:
         memory: Dict[str, str] = {}
-        if winreg is not None:
-            try:
-                registry_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_BASE_KEY, 0, winreg.KEY_READ)
-                raw_json, _ = winreg.QueryValueEx(registry_key, REGISTRY_MEMORY_VALUE)
-                winreg.CloseKey(registry_key)
-                loaded = json.loads(raw_json)
-                if isinstance(loaded, dict):
-                    for key, value in loaded.items():
-                        normalized_key = normalize_for_match(str(key))
-                        normalized_value = str(value).strip()
-                        if normalized_key and normalized_value:
-                            memory[normalized_key] = normalized_value
-                return memory
-            except OSError:
-                pass
-            except Exception:
-                pass
-
-        fallback_path = self.get_fallback_memory_path()
-        if fallback_path.exists():
-            try:
-                loaded = json.loads(fallback_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    for key, value in loaded.items():
-                        normalized_key = normalize_for_match(str(key))
-                        normalized_value = str(value).strip()
-                        if normalized_key and normalized_value:
-                            memory[normalized_key] = normalized_value
-            except Exception:
-                pass
+        try:
+            if not self.company_mapping_path.exists():
+                self.company_mapping_path.write_text("{}", encoding="utf-8")
+            loaded = json.loads(self.company_mapping_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for key, value in loaded.items():
+                    raw_key = str(key).strip()
+                    mapped_name = str(value).strip()
+                    if raw_key and mapped_name:
+                        memory[raw_key] = mapped_name
+        except Exception:
+            pass
         return memory
 
     def save_persistent_company_memory(self) -> None:
-        raw_json = json.dumps(self.session_company_memory, ensure_ascii=False)
-        if winreg is not None:
-            try:
-                registry_key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, REGISTRY_BASE_KEY)
-                winreg.SetValueEx(registry_key, REGISTRY_MEMORY_VALUE, 0, winreg.REG_SZ, raw_json)
-                winreg.CloseKey(registry_key)
-                return
-            except OSError:
-                pass
-            except Exception:
-                pass
-
-        fallback_path = self.get_fallback_memory_path()
-        fallback_path.write_text(raw_json, encoding="utf-8")
+        raw_json = json.dumps(self.session_company_memory, ensure_ascii=False, indent=2)
+        self.company_mapping_path.write_text(raw_json, encoding="utf-8")
 
     def save_last_memory_export(self, export_text: str) -> None:
         if not export_text.strip() or winreg is None:
@@ -2034,6 +2019,10 @@ class PdfToJpgApp(ctk.CTk):
                 )
                 try:
                     document_info = analyze_pdf(pdf_path, company_rules, self.session_company_memory.copy())
+                    mapped_company = lookup_company_mapping(self.session_company_memory, document_info.company_name)
+                    if mapped_company:
+                        document_info.company_name = mapped_company
+                        document_info.company_rule_source = "company-mapping-json"
                     documents.append(document_info)
                     success_count += 1
                     source_label = "OCR 보강" if document_info.used_ocr else "일반 추출"
