@@ -32,9 +32,10 @@ except ImportError:
     TkinterDnD = None
 
 
-DATE_PATTERN = re.compile(r"(\d{4}[-./]\d{1,2}[-./]\d{1,2})")
+DATE_PATTERN = re.compile(r"(\d{4}[-./]\d{1,2}[-./]\d{1,2}|\d{1,2}[-./]\d{1,2}[-./]\d{4})")
 DATE_LABEL_PATTERNS = [
-    re.compile(r"(?:발주일|주문일|수주일|po\s*date)\s*[:：]?\s*(\d{4}[-./]\d{1,2}[-./]\d{1,2})", re.IGNORECASE),
+    re.compile(r"(?:발주일|주문일|수주일|po\s*date|release\s*date)\s*[:：]?\s*(\d{4}[-./]\d{1,2}[-./]\d{1,2})", re.IGNORECASE),
+    re.compile(r"(?:발주일|주문일|수주일|po\s*date|release\s*date)\s*[:：]?\s*(\d{1,2}[-./]\d{1,2}[-./]\d{4})", re.IGNORECASE),
     re.compile(r"(?:발주일|주문일|수주일|po\s*date)\s*[:：]?\s*(\d{4}\s*년\s*\d{1,2}\s*월\s*\d{1,2}\s*일)", re.IGNORECASE),
 ]
 ORDER_LABEL_PATTERNS = [
@@ -44,12 +45,13 @@ ORDER_LABEL_PATTERNS = [
     ),
 ]
 GENERIC_ORDER_FALLBACK = re.compile(r"\b[A-Z]{1,6}(?:[-/]\d+|\d+)(?:[-/]\d+)?\b")
-PO_CODE_PATTERN = re.compile(r"\b[A-Z0-9\-]{5,}\b")
+PO_CODE_PATTERN = re.compile(r"\b[A-Z0-9][A-Z0-9\-/]{4,19}\b")
+PO_ALLOWED_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\-/]{4,19}$")
 DISALLOWED_PO_TOKENS = {"shall", "upon", "terms", "conditions", "delivery", "acceptance"}
 COMPANY_LABEL_EXCLUDE = {"company", "supplier", "vendor", "contact person", "telephone"}
 STRICT_COMPANY_BANNED_TOKENS = {
     "tel", "fax", "telephone", "phone", "mobile", "contact person",
-    "vendor code", "supplier code", "code:", "email", "@",
+    "vendor code", "supplier code", "code:", "email", "@", "http", "www",
 }
 HEADER_COMPANY_EXCLUDE_TOKENS = {"buyer", "contact", "attn", "tel", "fax", "email", "@", "phone", "mobile"}
 TERMS_KEYWORDS = {
@@ -93,7 +95,6 @@ COMPANY_STOPWORDS = {
 AUTO_COMPANY_LABEL_PATTERNS = [
     re.compile(r"(?:supplier|vendor|seller|maker|manufacturer|from)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
     re.compile(r"(?:공급자|판매자|납품처|제조사|업체명|상호)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
-    re.compile(r"(?:bill\s*to|ship\s*to|buyer|customer|consignee|수신|공급받는자|발주처)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
 ]
 CORPORATE_NAME_LINE_PATTERNS = [
     re.compile(r"([가-힣A-Za-z0-9&().,/\-\s]{2,80}(?:주식회사|㈜|Co\.?\s*,?\s*Ltd\.?|CO\.?\s*,?\s*LTD\.?|Inc\.?|LLC))", re.IGNORECASE),
@@ -250,11 +251,45 @@ def normalize_date(raw_date: str) -> str:
         return MISSING_VALUE
 
     try:
-        year, month, day = (int(part) for part in parts)
+        first, second, third = (int(part) for part in parts)
+        if first >= 1900:
+            year, month, day = first, second, third
+        elif third >= 1900:
+            year, month, day = third, first, second
+        else:
+            return MISSING_VALUE
         parsed = datetime(year, month, day)
         return parsed.strftime("%Y-%m-%d")
     except ValueError:
         return MISSING_VALUE
+
+
+def is_date_like_number(compact: str) -> bool:
+    if not re.fullmatch(r"\d{8}", compact):
+        return False
+    year_first = int(compact[:4])
+    month_first = int(compact[4:6])
+    day_first = int(compact[6:8])
+    if 1900 <= year_first <= 2100 and 1 <= month_first <= 12 and 1 <= day_first <= 31:
+        return True
+
+    month_second = int(compact[:2])
+    day_second = int(compact[2:4])
+    year_second = int(compact[4:8])
+    return 1 <= month_second <= 12 and 1 <= day_second <= 31 and 1900 <= year_second <= 2100
+
+
+def is_full_date_token(value: str) -> bool:
+    token = value.strip()
+    if not token:
+        return False
+    if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", token):
+        return normalize_date(token) != MISSING_VALUE
+    if re.fullmatch(r"\d{1,2}[-./]\d{1,2}[-./]\d{4}", token):
+        return normalize_date(token) != MISSING_VALUE
+    if re.fullmatch(r"\d{8}", token):
+        return is_date_like_number(token)
+    return False
 
 
 def normalize_for_match(text: str) -> str:
@@ -354,7 +389,14 @@ def clean_company_candidate(candidate: str) -> str:
 
 
 
+def has_hard_banned_company_marker(candidate: str) -> bool:
+    lowered = candidate.lower()
+    return any(token in lowered for token in ["fax", "tel", "telephone", "phone", "mobile", "vendor code", "supplier code", "contact"])
+
+
 def is_plausible_company_candidate(candidate: str) -> bool:
+    if has_hard_banned_company_marker(candidate):
+        return False
     value = clean_company_candidate(candidate)
     if len(value) < 2 or len(value) > 80:
         return False
@@ -373,13 +415,19 @@ def is_plausible_company_candidate(candidate: str) -> bool:
 
 
 def is_valid_company_candidate_strict(candidate: str) -> bool:
+    if has_hard_banned_company_marker(candidate):
+        return False
     value = clean_company_candidate(candidate)
     if len(value) < 2 or len(value) > 70:
+        return False
+    if "\n" in candidate:
         return False
     if is_excluded_company_name(value):
         return False
     lowered = value.lower()
     if any(token in lowered for token in STRICT_COMPANY_BANNED_TOKENS):
+        return False
+    if ":" in value:
         return False
     if re.search(r"[\w\.-]+@[\w\.-]+\.\w+", value):
         return False
@@ -388,6 +436,8 @@ def is_valid_company_candidate_strict(candidate: str) -> bool:
     if re.search(r"\b(?:zip|postal\s*code|postcode)\b", lowered):
         return False
     if re.search(r"\b\d{3,5}-\d{3,5}\b", value):
+        return False
+    if looks_like_person_name(value):
         return False
     if re.fullmatch(r"[\d\W]+", value):
         return False
@@ -495,6 +545,8 @@ def is_valid_po_number(candidate: str) -> bool:
         return False
     if re.search(r"\s{3,}", raw):
         return False
+    if ":" in raw:
+        return False
     tokens = [token for token in raw.split() if token]
     if len(tokens) >= 4:
         return False
@@ -509,16 +561,16 @@ def is_valid_po_number(candidate: str) -> bool:
         return False
     if len(re.findall(r"[A-Za-z]{3,}", raw)) >= 3 and len(tokens) >= 3:
         return False
-    compact = clean_order_candidate(raw)
-    if re.fullmatch(r"\d{8}", compact):
-        yyyy = int(compact[:4])
-        mm = int(compact[4:6])
-        dd = int(compact[6:8])
-        if 1900 <= yyyy <= 2100 and 1 <= mm <= 12 and 1 <= dd <= 31:
-            return False
-    if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", raw) or re.fullmatch(r"\d{1,2}[-./]\d{1,2}[-./]\d{4}", raw):
+    if re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw):
         return False
-    if not PO_CODE_PATTERN.fullmatch(compact):
+    if re.search(r"(?:\+82|82-|031-|02-|010-)", raw):
+        return False
+    compact = clean_order_candidate(raw)
+    # 날짜 제거는 "문자열 전체가 날짜일 때"만 적용한다.
+    # 예: PO20260124-123 / AB-20260124-99 는 허용.
+    if is_full_date_token(raw) or is_full_date_token(compact):
+        return False
+    if not PO_ALLOWED_PATTERN.fullmatch(compact):
         return False
     if re.search(r"\d", compact) is None:
         return False
@@ -559,7 +611,7 @@ def is_terms_block(text: str) -> bool:
     ]
     if has_core_label(content):
         return False
-    return len(english_sentence_lines) >= 3 and keyword_hits >= 2
+    return len(english_sentence_lines) >= 7 and keyword_hits >= 2
 
 
 def is_terms_page(page_text: str) -> bool:
@@ -649,14 +701,11 @@ def get_nearby_value(label_block: Dict[str, object], blocks: List[Dict[str, obje
 
 def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
     rect = page.rect
-    top_limit = rect.y0 + rect.height * 0.4
     blocks_raw = page.get_text("blocks")
     blocks: List[Dict[str, object]] = []
     for block in blocks_raw:
         converted = _to_block_dict(block)
         if converted is None:
-            continue
-        if float(converted["y0"]) > top_limit:
             continue
         if is_terms_block(str(converted["text"])):
             continue
@@ -665,7 +714,6 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
 
     company_label_patterns = [re.compile(r"\bcompany\b", re.IGNORECASE)]
     vendor_label_patterns = [re.compile(r"\b(?:vendor|supplier|seller|from)\b", re.IGNORECASE)]
-    buyer_label_patterns = [re.compile(r"\bbuyer\b", re.IGNORECASE)]
     po_label_patterns = [
         re.compile(r"\bpo\s*number\b", re.IGNORECASE),
         re.compile(r"\bpo\s*no\.?\b", re.IGNORECASE),
@@ -689,6 +737,8 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
         return 0
 
     def evaluate_company_text(text: str, require_corp: bool = False) -> Optional[str]:
+        if text.count("\n") >= 1:
+            return None
         cleaned = clean_company_candidate(text)
         if not cleaned:
             return None
@@ -795,19 +845,28 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
 
     company_candidates = collect_label_candidates(company_label_patterns, base_score=170)
     vendor_candidates = collect_label_candidates(vendor_label_patterns, base_score=130)
-    buyer_candidates = collect_label_candidates(buyer_label_patterns, base_score=80, require_corp=True)
-
-    prioritized = [header_candidates, company_candidates, vendor_candidates, buyer_candidates]
+    prioritized = [header_candidates, company_candidates, vendor_candidates]
     for group in prioritized:
         if not group:
             continue
         group.sort(key=lambda item: item[0], reverse=True)
-        company_value = group[0][1]
+        top_score = group[0][0]
+        tied = [item for item in group if abs(item[0] - top_score) <= 8]
+        if len(tied) >= 2:
+            company_value = ""
+        else:
+            company_value = group[0][1]
         break
 
     po_label = find_label_block(blocks, po_label_patterns)
     if po_label is not None:
-        around = [get_nearby_value(po_label, blocks)]
+        nearby_primary = get_nearby_value(po_label, blocks)
+        if nearby_primary:
+            for match in PO_CODE_PATTERN.findall(nearby_primary):
+                if is_valid_po_number(match):
+                    po_candidates.append(clean_order_candidate(match))
+
+        around: List[str] = []
         px0 = float(po_label["x0"])
         py0 = float(po_label["y0"])
         py1 = float(po_label["y1"])
@@ -856,16 +915,6 @@ def detect_company_name(
     company_rules: List[CompanyRule],
     session_company_memory: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str, str, List[str]]:
-    normalized_text = normalize_for_match(full_text)
-    if company_rules and normalized_text:
-        for rule in company_rules:
-            for alias in rule.all_names:
-                normalized_alias = normalize_for_match(alias)
-                if not normalized_alias or is_excluded_company_name(alias):
-                    continue
-                if normalized_alias in normalized_text:
-                    return rule.display_name, alias, rule.source, []
-
     candidates = collect_auto_company_candidates(full_text)
     if session_company_memory:
         for candidate in candidates:
@@ -873,9 +922,7 @@ def detect_company_name(
             if learned_name and not is_excluded_company_name(learned_name):
                 return learned_name, candidate, "session-memory", candidates
 
-    if candidates:
-        return candidates[0], candidates[0], "auto-detected", candidates
-    return MISSING_VALUE, "", "", []
+    return MISSING_VALUE, "", "", candidates
 
 
 def lookup_company_mapping(mapping: Dict[str, str], source_name: str) -> str:
@@ -986,15 +1033,17 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         merged_for_alias = normalize_document_text("\n".join([part for part in [top_text, full_text] if part.strip()]))
         detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_for_alias, company_rules, session_company_memory)
         block_company = str(block_result.get("company_name", "")).strip()
-        prefer_detected = detected_company != MISSING_VALUE and (company_source not in {"", "auto-detected"} or not block_company)
-        company_name = detected_company if prefer_detected else block_company
+        company_name = block_company
+        if not company_name and detected_company != MISSING_VALUE and company_source == "session-memory":
+            company_name = detected_company
         if not company_name:
             company_name = MISSING_VALUE
             matched_alias = ""
             company_source = ""
 
         block_orders = [value for value in block_result.get("order_numbers", []) if isinstance(value, str)]
-        regex_orders = [clean_order_candidate(match.group(0)) for match in PO_CODE_PATTERN.finditer(working_text) if is_valid_po_number(match.group(0))]
+        scan_text = normalize_document_text("\n".join(part for part in [working_text, full_text] if part.strip()))
+        regex_orders = [clean_order_candidate(match.group(0)) for match in PO_CODE_PATTERN.finditer(scan_text) if is_valid_po_number(match.group(0))]
         order_numbers = unique_preserve_order([*block_orders, *regex_orders])
         filename_orders = extract_po_from_filename(pdf_path.stem)
         if not order_numbers and filename_orders:
@@ -1014,12 +1063,13 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                 used_ocr = True
                 merged_top_text = normalize_document_text("\n".join(part for part in [working_text, ocr_text] if part.strip()))
                 detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_top_text, company_rules, session_company_memory)
-                if company_name == MISSING_VALUE and detected_company != MISSING_VALUE:
+                if company_name == MISSING_VALUE and detected_company != MISSING_VALUE and company_source == "session-memory":
                     company_name = detected_company
 
+                merged_scan_text = normalize_document_text("\n".join(part for part in [merged_top_text, full_text] if part.strip()))
                 regex_orders = [
                     clean_order_candidate(match.group(0))
-                    for match in PO_CODE_PATTERN.finditer(merged_top_text)
+                    for match in PO_CODE_PATTERN.finditer(merged_scan_text)
                     if is_valid_po_number(match.group(0))
                 ]
                 order_numbers = unique_preserve_order([*order_numbers, *regex_orders])
@@ -1708,7 +1758,17 @@ class PdfToJpgApp(ctk.CTk):
             key, value = line.split("=", 1)
             raw_key = key.strip()
             company_name = value.strip()
-            if not raw_key or not company_name or is_excluded_company_name(company_name):
+            if not raw_key:
+                skipped += 1
+                continue
+            if company_name in {"-", "__DELETE__", "삭제"}:
+                if raw_key in self.session_company_memory:
+                    del self.session_company_memory[raw_key]
+                    added += 1
+                else:
+                    skipped += 1
+                continue
+            if not company_name or is_excluded_company_name(company_name):
                 skipped += 1
                 continue
             self.session_company_memory[raw_key] = company_name
@@ -1728,7 +1788,7 @@ class PdfToJpgApp(ctk.CTk):
 
         ctk.CTkLabel(
             dialog,
-            text="복사해둔 회사명 기억을 붙여넣으세요. 형식: 감지값=확정회사명",
+            text="복사해둔 회사명 기억을 붙여넣으세요. 형식: 감지값=확정회사명 (삭제: 감지값=-)",
             font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold"),
             text_color="#4a3f35",
             justify="left",
