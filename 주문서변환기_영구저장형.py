@@ -280,6 +280,19 @@ def is_date_like_number(compact: str) -> bool:
     return 1 <= month_second <= 12 and 1 <= day_second <= 31 and 1900 <= year_second <= 2100
 
 
+def is_full_date_token(value: str) -> bool:
+    token = value.strip()
+    if not token:
+        return False
+    if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", token):
+        return normalize_date(token) != MISSING_VALUE
+    if re.fullmatch(r"\d{1,2}[-./]\d{1,2}[-./]\d{4}", token):
+        return normalize_date(token) != MISSING_VALUE
+    if re.fullmatch(r"\d{8}", token):
+        return is_date_like_number(token)
+    return False
+
+
 def normalize_for_match(text: str) -> str:
     """회사명 비교를 위해 공백, 줄바꿈, 구분기호를 제거한다."""
     lowered = text.lower()
@@ -545,9 +558,9 @@ def is_valid_po_number(candidate: str) -> bool:
     if re.search(r"(?:\+82|82-|031-|02-|010-)", raw):
         return False
     compact = clean_order_candidate(raw)
-    if is_date_like_number(compact):
-        return False
-    if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", raw) or re.fullmatch(r"\d{1,2}[-./]\d{1,2}[-./]\d{4}", raw):
+    # 날짜 제거는 "문자열 전체가 날짜일 때"만 적용한다.
+    # 예: PO20260124-123 / AB-20260124-99 는 허용.
+    if is_full_date_token(raw) or is_full_date_token(compact):
         return False
     if not PO_ALLOWED_PATTERN.fullmatch(compact):
         return False
