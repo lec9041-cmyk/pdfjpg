@@ -51,7 +51,7 @@ STRICT_COMPANY_BANNED_TOKENS = {
     "tel", "fax", "telephone", "phone", "mobile", "contact person",
     "vendor code", "supplier code", "code:", "email", "@",
 }
-HEADER_COMPANY_EXCLUDE_TOKENS = {"buyer", "contact", "attn", "tel", "fax", "email", "@"}
+HEADER_COMPANY_EXCLUDE_TOKENS = {"buyer", "contact", "attn", "tel", "fax", "email", "@", "phone", "mobile"}
 TERMS_KEYWORDS = {
     "terms", "conditions", "delivery", "acceptance", "warranty", "liability",
     "agreement", "payment", "shall", "upon",
@@ -756,14 +756,20 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
         return scored
 
     header_y_limit = rect.y0 + rect.height * 0.30
-    header_x_limit = rect.x0 + rect.width * 0.40
-    header_blocks = [
+    left_header_x_limit = rect.x0 + rect.width * 0.40
+    right_header_x_limit = rect.x0 + rect.width * 0.60
+    left_header_blocks = [
         block for block in blocks
         if float(block["y0"]) <= header_y_limit
-        and float(block["x0"]) <= header_x_limit
+        and float(block["x0"]) <= left_header_x_limit
+    ]
+    right_header_blocks = [
+        block for block in blocks
+        if float(block["y0"]) <= header_y_limit
+        and float(block["x0"]) >= right_header_x_limit
     ]
     header_candidates: List[Tuple[int, str]] = []
-    for block in header_blocks:
+    for block in left_header_blocks:
         text = clean_company_candidate(str(block["text"]))
         lowered = text.lower()
         if not text or any(token in lowered for token in HEADER_COMPANY_EXCLUDE_TOKENS):
@@ -773,6 +779,18 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
             continue
         short_logo_bonus = 12 if len(candidate) <= 30 and "\n" not in str(block["text"]) else 0
         score = 240 + corp_token_bonus(candidate) + short_logo_bonus - int(float(block["y0"]) * 0.02 + float(block["x0"]) * 0.02)
+        header_candidates.append((score, candidate))
+
+    for block in right_header_blocks:
+        text = clean_company_candidate(str(block["text"]))
+        lowered = text.lower()
+        if not text or any(token in lowered for token in HEADER_COMPANY_EXCLUDE_TOKENS):
+            continue
+        candidate = evaluate_company_text(text, require_corp=True)
+        if not candidate:
+            continue
+        short_logo_bonus = 6 if len(candidate) <= 30 and "\n" not in str(block["text"]) else 0
+        score = 210 + corp_token_bonus(candidate) + short_logo_bonus - int(float(block["y0"]) * 0.02 + float(block["x0"]) * 0.02)
         header_candidates.append((score, candidate))
 
     company_candidates = collect_label_candidates(company_label_patterns, base_score=170)
