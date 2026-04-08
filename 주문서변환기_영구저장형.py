@@ -47,6 +47,10 @@ GENERIC_ORDER_FALLBACK = re.compile(r"\b[A-Z]{1,6}(?:[-/]\d+|\d+)(?:[-/]\d+)?\b"
 PO_CODE_PATTERN = re.compile(r"\b[A-Z0-9\-]{5,}\b")
 DISALLOWED_PO_TOKENS = {"shall", "upon", "terms", "conditions", "delivery", "acceptance"}
 COMPANY_LABEL_EXCLUDE = {"company", "supplier", "vendor", "contact person", "telephone"}
+STRICT_COMPANY_BANNED_TOKENS = {
+    "tel", "fax", "telephone", "phone", "mobile", "contact person",
+    "vendor code", "supplier code", "code:", "email", "@",
+}
 TERMS_KEYWORDS = {
     "terms", "conditions", "delivery", "acceptance", "warranty", "liability",
     "agreement", "payment", "shall", "upon",
@@ -367,6 +371,40 @@ def is_plausible_company_candidate(candidate: str) -> bool:
     return True
 
 
+def is_valid_company_candidate_strict(candidate: str) -> bool:
+    value = clean_company_candidate(candidate)
+    if len(value) < 2 or len(value) > 70:
+        return False
+    lowered = value.lower()
+    if any(token in lowered for token in STRICT_COMPANY_BANNED_TOKENS):
+        return False
+    if re.search(r"[\w\.-]+@[\w\.-]+\.\w+", value):
+        return False
+    if re.search(r"(?:\+82|82-|031-|02-|010-)", value):
+        return False
+    if re.search(r"\b(?:zip|postal\s*code|postcode)\b", lowered):
+        return False
+    if re.search(r"\b\d{3,5}-\d{3,5}\b", value):
+        return False
+    if re.fullmatch(r"[\d\W]+", value):
+        return False
+
+    digit_ratio = sum(ch.isdigit() for ch in value) / max(len(value), 1)
+    if digit_ratio >= 0.4:
+        return False
+
+    address_markers = ["road", "street", "st.", "avenue", "building", "floor", "dong", "gu", "si", "city", "address"]
+    if len(value) >= 45 and any(marker in lowered for marker in address_markers):
+        return False
+
+    has_corp_suffix = any(token in lowered for token in [" co", " ltd", " inc", " llc", " corp", "주식회사", "㈜"])
+    has_letter_dominance = (
+        (sum(ch.isalpha() or ("가" <= ch <= "힣") for ch in value) / max(len(value), 1)) >= 0.6
+        and digit_ratio <= 0.2
+    )
+    return has_corp_suffix or has_letter_dominance
+
+
 
 def score_company_candidate(candidate: str, source: str = "") -> int:
     value = clean_company_candidate(candidate)
@@ -614,35 +652,68 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
 
     company_label = find_label_block(blocks, company_label_patterns)
     if company_label is not None:
-        nearby = get_nearby_value(company_label, blocks)
-        if nearby:
-            company_value = nearby
-        below = [
-            block
-            for block in blocks
-            if float(block["y0"]) >= float(company_label["y1"]) - 1
-            and float(block["y0"]) <= float(company_label["y1"]) + 130
-            and float(block["x0"]) >= float(company_label["x0"]) - 40
-            and float(block["x0"]) <= float(company_label["x1"]) + 340
+        lx0 = float(company_label["x0"])
+        ly0 = float(company_label["y0"])
+        lx1 = float(company_label["x1"])
+        ly1 = float(company_label["y1"])
+        line_h = max(12.0, ly1 - ly0)
+
+        def company_score(block: Dict[str, object], position_bonus: int) -> Optional[Tuple[int, str]]:
+            text = clean_company_candidate(str(block["text"]))
+            if not text or text.lower() in COMPANY_LABEL_EXCLUDE:
+                return None
+            if not is_valid_company_candidate_strict(text):
+                return None
+            corp_bonus = 20 if any(token in text.lower() for token in [" co", " ltd", " inc", " llc", " corp", "주식회사", "㈜"]) else 0
+            distance_penalty = int(abs(float(block["y0"]) - ly0) + abs(float(block["x0"]) - lx1) * 0.1)
+            score = 100 + position_bonus + corp_bonus - distance_penalty
+            return score, text
+
+        candidates: List[Tuple[int, str]] = []
+
+        right_blocks = [
+            block for block in blocks
+            if block is not company_label
+            and float(block["x0"]) >= lx1 - 3
+            and abs(float(block["y0"]) - ly0) <= line_h * 0.6
+            and float(block["x0"]) <= lx1 + 420
         ]
-        below.sort(key=lambda block: (float(block["y0"]), float(block["x0"])))
-        collected_lines: List[str] = []
-        for block in below:
-            line = str(block["text"]).strip()
-            if not line:
-                continue
-            lowered = line.lower()
-            if any(stop in lowered for stop in ["tel", "fax", "telephone", "bill to", "deliver"]):
-                break
-            if re.fullmatch(r"[\d\W]+", line):
-                break
-            if lowered in COMPANY_LABEL_EXCLUDE:
-                continue
-            collected_lines.append(clean_company_candidate(line))
-            if len(collected_lines) >= 4:
-                break
-        if collected_lines:
-            company_value = " ".join(collected_lines[:4]).strip()
+        right_blocks.sort(key=lambda block: (abs(float(block["y0"]) - ly0), float(block["x0"])))
+        for block in right_blocks[:2]:
+            scored = company_score(block, 40)
+            if scored:
+                candidates.append(scored)
+
+        diag_blocks = [
+            block for block in blocks
+            if block is not company_label
+            and float(block["x0"]) >= lx1 - 3
+            and float(block["x0"]) <= lx1 + 420
+            and float(block["y0"]) > ly1 - 2
+            and float(block["y0"]) <= ly1 + line_h * 2.6
+        ]
+        diag_blocks.sort(key=lambda block: (float(block["y0"]), float(block["x0"])))
+        for block in diag_blocks[:1]:
+            scored = company_score(block, 20)
+            if scored:
+                candidates.append(scored)
+
+        below_blocks = [
+            block for block in blocks
+            if block is not company_label
+            and abs(float(block["x0"]) - lx0) <= 120
+            and float(block["y0"]) > ly1 - 2
+            and float(block["y0"]) <= ly1 + line_h * 3.0
+        ]
+        below_blocks.sort(key=lambda block: (float(block["y0"]), abs(float(block["x0"]) - lx0)))
+        for block in below_blocks[:2]:
+            scored = company_score(block, 10)
+            if scored:
+                candidates.append(scored)
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            company_value = candidates[0][1]
 
     po_label = find_label_block(blocks, po_label_patterns)
     if po_label is not None:
