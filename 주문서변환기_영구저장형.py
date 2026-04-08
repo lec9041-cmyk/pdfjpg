@@ -47,6 +47,18 @@ GENERIC_ORDER_FALLBACK = re.compile(r"\b[A-Z]{1,6}(?:[-/]\d+|\d+)(?:[-/]\d+)?\b"
 PO_CODE_PATTERN = re.compile(r"\b[A-Z0-9\-]{5,}\b")
 DISALLOWED_PO_TOKENS = {"shall", "upon", "terms", "conditions", "delivery", "acceptance"}
 COMPANY_LABEL_EXCLUDE = {"company", "supplier", "vendor", "contact person", "telephone"}
+TERMS_KEYWORDS = {
+    "terms", "conditions", "delivery", "acceptance", "warranty", "liability",
+    "agreement", "payment", "shall", "upon",
+}
+CORE_FIELD_LABELS = [
+    re.compile(r"\bcompany\b", re.IGNORECASE),
+    re.compile(r"\bpo\s*number\b", re.IGNORECASE),
+    re.compile(r"\bpo\s*no\.?\b", re.IGNORECASE),
+    re.compile(r"\bp\s*/\s*o\s*no\.?\b", re.IGNORECASE),
+    re.compile(r"\bpo\s*date\b", re.IGNORECASE),
+    re.compile(r"\brelease\s*date\b", re.IGNORECASE),
+]
 SUPPORTED_EXTENSIONS = {".pdf"}
 LANDSCAPE_SIZE = (1200, 800)
 PORTRAIT_SIZE = (800, 1200)
@@ -421,6 +433,8 @@ def is_valid_po_number(candidate: str) -> bool:
     raw = candidate.strip()
     if not raw:
         return False
+    if len(raw) < 5 or len(raw) > 20:
+        return False
     if re.search(r"\s{3,}", raw):
         return False
     tokens = [token for token in raw.split() if token]
@@ -429,14 +443,71 @@ def is_valid_po_number(candidate: str) -> bool:
     lowered = raw.lower()
     if any(token in lowered for token in DISALLOWED_PO_TOKENS):
         return False
+    punctuation_count = sum(raw.count(symbol) for symbol in [".", ",", ";", ":"])
+    if punctuation_count >= 2:
+        return False
+    lower_alpha = sum(ch.isalpha() and ch.islower() for ch in raw)
+    if lower_alpha >= 3:
+        return False
     if len(re.findall(r"[A-Za-z]{3,}", raw)) >= 3 and len(tokens) >= 3:
         return False
     compact = clean_order_candidate(raw)
     if not PO_CODE_PATTERN.fullmatch(compact):
         return False
-    if re.search(r"[A-Z]", compact) is None and re.search(r"\d", compact) is None:
+    if re.search(r"\d", compact) is None:
+        return False
+    if re.search(r"[A-Z]", compact) is None and re.search(r"[0-9]", compact) is None:
         return False
     return True
+
+
+def extract_po_from_filename(filename_stem: str) -> List[str]:
+    normalized = filename_stem.replace("_", " ").replace(".", " ").strip()
+    candidates: List[str] = []
+    for match in re.finditer(r"[A-Z0-9\-/]{5,20}", normalized.upper()):
+        token = match.group(0).strip("-/")
+        if not token:
+            continue
+        lowered = token.lower()
+        if any(word in lowered for word in ["shall", "terms", "conditions", "order", "delivery", "acceptance"]):
+            continue
+        if is_valid_po_number(token):
+            candidates.append(clean_order_candidate(token))
+    return unique_preserve_order(candidates)
+
+
+def has_core_label(text: str) -> bool:
+    return any(pattern.search(text) for pattern in CORE_FIELD_LABELS)
+
+
+def is_terms_block(text: str) -> bool:
+    content = text.strip()
+    if not content:
+        return False
+    lowered = content.lower()
+    keyword_hits = sum(1 for keyword in TERMS_KEYWORDS if keyword in lowered)
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    english_sentence_lines = [
+        line for line in lines
+        if len(line) >= 40 and re.search(r"[A-Za-z]{4,}", line) and sum(line.count(s) for s in [".", ",", ";"]) >= 2
+    ]
+    if has_core_label(content):
+        return False
+    return len(english_sentence_lines) >= 3 and keyword_hits >= 2
+
+
+def is_terms_page(page_text: str) -> bool:
+    text = page_text.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    english_sentence_lines = [
+        line for line in lines
+        if len(line) >= 40 and re.search(r"[A-Za-z]{4,}", line) and sum(line.count(s) for s in [".", ",", ";"]) >= 2
+    ]
+    keyword_hits = sum(1 for keyword in TERMS_KEYWORDS if keyword in lowered)
+    return len(english_sentence_lines) >= 7 and keyword_hits >= 2 and not has_core_label(text)
 
 
 def _to_block_dict(block: Tuple) -> Optional[Dict[str, object]]:
@@ -520,6 +591,8 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
         if converted is None:
             continue
         if float(converted["y0"]) > top_limit:
+            continue
+        if is_terms_block(str(converted["text"])):
             continue
         blocks.append(converted)
     blocks.sort(key=lambda item: (float(item["y0"]), float(item["x0"])))
@@ -685,13 +758,10 @@ def extract_order_numbers(full_text: str, company_rule: Optional[CompanyRule] = 
         for pattern in ORDER_LABEL_PATTERNS:
             matches.extend(pattern.findall(full_text))
 
-    if not matches:
-        matches.extend(GENERIC_ORDER_FALLBACK.findall(full_text))
-
     cleaned: List[str] = []
     for value in matches:
         candidate = clean_order_candidate(value)
-        if len(candidate) >= 3 and re.search(r"\d", candidate):
+        if is_valid_po_number(candidate):
             cleaned.append(candidate)
 
     return unique_preserve_order(cleaned)
@@ -712,9 +782,8 @@ def collect_raw_order_candidates(full_text: str, company_rule: Optional[CompanyR
     if not raw_matches:
         for pattern in ORDER_LABEL_PATTERNS:
             raw_matches.extend(pattern.findall(full_text))
-    if not raw_matches:
-        raw_matches.extend(GENERIC_ORDER_FALLBACK.findall(full_text))
-    return unique_preserve_order([clean_order_candidate(value) for value in raw_matches if clean_order_candidate(value)])
+    cleaned = [clean_order_candidate(value) for value in raw_matches if clean_order_candidate(value)]
+    return unique_preserve_order([value for value in cleaned if is_valid_po_number(value)])
 
 
 
@@ -743,7 +812,9 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         working_text = top_text if text_mode_enough else ""
         merged_for_alias = normalize_document_text("\n".join([part for part in [top_text, full_text] if part.strip()]))
         detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_for_alias, company_rules, session_company_memory)
-        company_name = detected_company if detected_company != MISSING_VALUE else str(block_result.get("company_name", "")).strip()
+        block_company = str(block_result.get("company_name", "")).strip()
+        prefer_detected = detected_company != MISSING_VALUE and (company_source not in {"", "auto-detected"} or not block_company)
+        company_name = detected_company if prefer_detected else block_company
         if not company_name:
             company_name = MISSING_VALUE
             matched_alias = ""
@@ -752,6 +823,9 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         block_orders = [value for value in block_result.get("order_numbers", []) if isinstance(value, str)]
         regex_orders = [clean_order_candidate(match.group(0)) for match in PO_CODE_PATTERN.finditer(working_text) if is_valid_po_number(match.group(0))]
         order_numbers = unique_preserve_order([*block_orders, *regex_orders])
+        filename_orders = extract_po_from_filename(pdf_path.stem)
+        if not order_numbers and filename_orders:
+            order_numbers = filename_orders[:]
 
         date_from_blocks = str(block_result.get("document_date", "")).strip()
         if date_from_blocks and normalize_date(date_from_blocks) != MISSING_VALUE:
@@ -776,6 +850,8 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                     if is_valid_po_number(match.group(0))
                 ]
                 order_numbers = unique_preserve_order([*order_numbers, *regex_orders])
+                if not order_numbers and filename_orders:
+                    order_numbers = filename_orders[:]
                 if document_date == MISSING_VALUE:
                     document_date = extract_document_date(merged_top_text, pdf_path.stem)
 
@@ -845,6 +921,31 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
         total_pages = len(document)
         for page_index in range(total_pages):
             page_number = page_index + 1
+            page = document.load_page(page_index)
+            page_text = ""
+            try:
+                page_text = normalize_document_text(page.get_text())
+            except Exception:
+                page_text = ""
+            should_skip_terms = (
+                page_index >= 1
+                and bool(page_text.strip())
+                and is_terms_page(page_text)
+            )
+
+            if should_skip_terms:
+                progress_callback(
+                    ProgressEvent(
+                        event_type="page",
+                        message=f"{pdf_path.name} {page_number}/{total_pages} 페이지 약관으로 판단되어 JPG 저장 생략",
+                        current_file=file_index,
+                        total_files=total_files,
+                        current_page=page_number,
+                        total_pages=total_pages,
+                    )
+                )
+                continue
+
             progress_callback(
                 ProgressEvent(
                     event_type="page",
@@ -860,7 +961,6 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
                 )
             )
 
-            page = document.load_page(page_index)
             image = render_page_to_image(page)
             final_image = fit_image_to_canvas(image)
             output_name = f"{company_name}-{document_date}-{order_number}-{page_number}.jpg"
