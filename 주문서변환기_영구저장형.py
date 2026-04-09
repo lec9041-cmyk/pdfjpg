@@ -1901,6 +1901,7 @@ class PdfToJpgApp(ctk.CTk):
         filter_row.grid_columnconfigure(0, weight=1)
 
         self.advanced_filter_toggle_button = ctk.CTkButton(
+            filter_row,
             text="고급 필터 열기",
             command=self.toggle_advanced_filter,
             width=120,
