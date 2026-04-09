@@ -1,4 +1,5 @@
 import csv
+import difflib
 import json
 import queue
 import re
@@ -1057,6 +1058,67 @@ def select_representative_order_number(order_numbers: List[str]) -> str:
     return best
 
 
+def normalize_po_for_compare(value: str) -> str:
+    cleaned = clean_order_candidate(value).upper()
+    cleaned = re.sub(r"[-/\s]+", "", cleaned)
+    return cleaned
+
+
+def po_similarity(a: str, b: str) -> float:
+    na = normalize_po_for_compare(a)
+    nb = normalize_po_for_compare(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    if na in nb or nb in na:
+        shorter = min(len(na), len(nb))
+        longer = max(len(na), len(nb))
+        return 0.9 if shorter >= 6 and longer > 0 else 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def resolve_order_candidates_with_filename(pdf_orders: List[str], filename_orders: List[str]) -> Tuple[List[str], str]:
+    pdf_values = unique_preserve_order([clean_order_candidate(value) for value in pdf_orders if value and value != MISSING_VALUE])
+    file_values = unique_preserve_order([clean_order_candidate(value) for value in filename_orders if value and value != MISSING_VALUE])
+
+    if not pdf_values and not file_values:
+        return [MISSING_VALUE], MISSING_VALUE
+    if not pdf_values and file_values:
+        preferred = select_representative_order_number(file_values)
+        return file_values, preferred
+    if pdf_values and not file_values:
+        preferred = select_representative_order_number(pdf_values)
+        return pdf_values, preferred
+
+    best_pair: Optional[Tuple[str, str]] = None
+    best_score = 0.0
+    for pdf_value in pdf_values:
+        for file_value in file_values:
+            score = po_similarity(pdf_value, file_value)
+            if score > best_score:
+                best_score = score
+                best_pair = (pdf_value, file_value)
+
+    if best_pair and best_score >= 0.82:
+        preferred = best_pair[0]
+        merged = unique_preserve_order([preferred, best_pair[1], *pdf_values, *file_values])
+        return merged, preferred
+
+    if len(file_values) == 1:
+        preferred = file_values[0]
+        merged = unique_preserve_order([preferred, *pdf_values, *file_values])
+        return merged, preferred
+
+    if len(pdf_values) == 1 and len(file_values) > 1:
+        preferred = pdf_values[0]
+        merged = unique_preserve_order([preferred, *file_values, *pdf_values])
+        return merged, preferred
+
+    merged = unique_preserve_order([*pdf_values, *file_values])
+    return merged, MISSING_VALUE
+
+
 
 def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_company_memory: Optional[Dict[str, str]] = None) -> DocumentInfo:
     with fitz.open(pdf_path) as document:
@@ -1095,6 +1157,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
 
         text_mode_enough = len(re.sub(r"\s+", "", top_text)) >= 120
         working_text = top_text if text_mode_enough else ""
+        resolved_representative_order = MISSING_VALUE
 
         mapped_company = ""
         mapped_key = ""
@@ -1135,8 +1198,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             ]
             order_numbers = unique_preserve_order([*block_orders, *regex_orders])
         filename_orders = extract_po_from_filename(pdf_path.stem)
-        if not order_numbers and filename_orders:
-            order_numbers = filename_orders[:]
+        order_numbers, resolved_representative_order = resolve_order_candidates_with_filename(order_numbers, filename_orders)
 
         date_from_blocks = str(block_result.get("document_date", "")).strip()
         if date_from_blocks and normalize_date(date_from_blocks) != MISSING_VALUE:
@@ -1176,8 +1238,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                     if is_valid_po_number(match.group(0))
                 ]
                 order_numbers = unique_preserve_order([*order_numbers, *regex_orders])
-                if not order_numbers and filename_orders:
-                    order_numbers = filename_orders[:]
+                order_numbers, resolved_representative_order = resolve_order_candidates_with_filename(order_numbers, filename_orders)
                 if document_date == MISSING_VALUE:
                     document_date = extract_document_date(merged_top_text, pdf_path.stem)
 
@@ -1186,10 +1247,12 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             matched_alias = ""
         if not order_numbers:
             order_numbers = [MISSING_VALUE]
+        if resolved_representative_order == MISSING_VALUE:
+            resolved_representative_order = select_representative_order_number(order_numbers)
 
         raw_order_candidates = order_numbers[:]
 
-    representative_order_number = select_representative_order_number(order_numbers)
+    representative_order_number = resolved_representative_order
     missing_order_only = (not order_numbers) or (len(order_numbers) == 1 and order_numbers[0] == MISSING_VALUE)
     status = "OCR사용" if used_ocr else ("번호없음" if missing_order_only else "분석완료")
     excerpt = " ".join(full_text.split())[:160]
