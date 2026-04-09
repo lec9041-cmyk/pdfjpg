@@ -72,6 +72,13 @@ TERMS_KEYWORDS = {
     "terms", "conditions", "delivery", "acceptance", "warranty", "liability",
     "agreement", "payment", "shall", "upon",
 }
+DENSE_TEXT_MIN_LINES = 10
+DENSE_TEXT_MIN_LONG_LINES = 8
+DENSE_TEXT_MIN_AVG_LINE_LENGTH = 28
+DENSE_TEXT_MIN_SENTENCE_RATIO = 0.55
+DENSE_TEXT_MAX_AVG_FONT_SIZE = 11.0
+DENSE_TEXT_MIN_COVERAGE_RATIO = 0.45
+DENSE_TEXT_MIN_CHAR_COUNT = 450
 CORE_FIELD_LABELS = [
     re.compile(r"\bcompany\b", re.IGNORECASE),
     re.compile(r"\bpo\s*number\b", re.IGNORECASE),
@@ -762,64 +769,64 @@ def is_terms_page(page_text: str) -> bool:
 
 
 def is_dense_small_text_page(page: fitz.Page) -> bool:
+    """작은 글꼴의 줄글 페이지(영문/한글)를 감지한다."""
     try:
-        page_dict = page.get_text("dict")
+        text_dict = page.get_text("dict")
     except Exception:
         return False
 
-    blocks = page_dict.get("blocks", []) if isinstance(page_dict, dict) else []
-    page_rect = page.rect
-    page_area = max(page_rect.width * page_rect.height, 1.0)
-
-    text_area_sum = 0.0
+    page_area = max(page.rect.width * page.rect.height, 1.0)
     line_texts: List[str] = []
-    font_sizes: List[float] = []
-    total_chars = 0
+    weighted_font_sum = 0.0
+    weighted_font_weight = 0.0
+    text_coverage_area = 0.0
 
-    for block in blocks:
-        if not isinstance(block, dict) or block.get("type") != 0:
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:
             continue
-        bbox = block.get("bbox")
-        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
-            x0, y0, x1, y1 = bbox
-            text_area_sum += max((x1 - x0), 0) * max((y1 - y0), 0)
-
-        for line in block.get("lines", []) or []:
-            spans = line.get("spans", []) if isinstance(line, dict) else []
-            line_text = "".join(str(span.get("text", "")) for span in spans if isinstance(span, dict)).strip()
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            line_text = "".join(str(span.get("text", "")) for span in spans).strip()
             if not line_text:
                 continue
             line_texts.append(line_text)
-            total_chars += len(line_text)
-            for span in spans:
-                if not isinstance(span, dict):
-                    continue
-                size = span.get("size")
-                if isinstance(size, (int, float)):
-                    span_text = str(span.get("text", ""))
-                    repeat = max(len(span_text.strip()), 1)
-                    font_sizes.extend([float(size)] * min(repeat, 12))
 
-    line_count = len(line_texts)
-    if line_count == 0:
+            line_weight = max(len(re.sub(r"\s+", "", line_text)), 1)
+            span_font_sizes = [float(span.get("size", 0.0)) for span in spans if float(span.get("size", 0.0)) > 0.0]
+            if span_font_sizes:
+                avg_line_font = sum(span_font_sizes) / len(span_font_sizes)
+                weighted_font_sum += avg_line_font * line_weight
+                weighted_font_weight += line_weight
+
+            line_bbox = line.get("bbox")
+            if isinstance(line_bbox, (list, tuple)) and len(line_bbox) == 4:
+                x0, y0, x1, y1 = [float(value) for value in line_bbox]
+                text_coverage_area += max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+    if not line_texts:
         return False
 
-    avg_line_length = sum(len(line) for line in line_texts) / line_count
-    sentence_like_lines = [
-        line for line in line_texts
-        if (len(line) >= 28 and (line.count(".") + line.count("!") + line.count("?") + line.count("。") >= 1))
-    ]
-    sentence_ratio = len(sentence_like_lines) / max(line_count, 1)
-    avg_font_size = (sum(font_sizes) / len(font_sizes)) if font_sizes else 99.0
-    text_coverage_ratio = text_area_sum / page_area
+    line_count = len(line_texts)
+    normalized_lengths = [len(re.sub(r"\s+", "", line)) for line in line_texts]
+    avg_line_length = sum(normalized_lengths) / max(line_count, 1)
+    long_line_count = sum(1 for length in normalized_lengths if length >= DENSE_TEXT_MIN_AVG_LINE_LENGTH)
+    sentence_line_count = sum(1 for line in line_texts if re.search(r"[.!?。！？]", line))
+    sentence_ratio = sentence_line_count / max(line_count, 1)
+    avg_font_size = weighted_font_sum / weighted_font_weight if weighted_font_weight > 0 else 99.0
+    coverage_ratio = min(text_coverage_area / page_area, 1.0)
+    total_chars = sum(normalized_lengths)
 
-    is_dense_lines = line_count >= 10
-    is_long_lines = avg_line_length >= 30
-    is_sentence_heavy = sentence_ratio >= 0.35
-    is_small_font = avg_font_size <= 11.0
-    is_text_heavy = text_coverage_ratio >= 0.45 or total_chars >= 700
-
-    return all([is_dense_lines, is_long_lines, is_sentence_heavy, is_small_font, is_text_heavy])
+    return (
+        line_count >= DENSE_TEXT_MIN_LINES
+        and long_line_count >= DENSE_TEXT_MIN_LONG_LINES
+        and avg_line_length >= DENSE_TEXT_MIN_AVG_LINE_LENGTH
+        and sentence_ratio >= DENSE_TEXT_MIN_SENTENCE_RATIO
+        and avg_font_size <= DENSE_TEXT_MAX_AVG_FONT_SIZE
+        and coverage_ratio >= DENSE_TEXT_MIN_COVERAGE_RATIO
+        and total_chars >= DENSE_TEXT_MIN_CHAR_COUNT
+    )
 
 
 def _to_block_dict(block: Tuple) -> Optional[Dict[str, object]]:
@@ -1713,17 +1720,28 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
                 page_text = normalize_document_text(page.get_text())
             except Exception:
                 page_text = ""
-            should_skip_terms = (
-                page_index >= 1
-                and bool(page_text.strip())
-                and is_terms_page(page_text)
-            )
+            should_skip_terms = bool(page_text.strip()) and is_terms_page(page_text)
+            should_skip_dense_text = is_dense_small_text_page(page)
 
             if should_skip_terms:
                 progress_callback(
                     ProgressEvent(
                         event_type="page",
                         message=f"{pdf_path.name} {page_number}/{total_pages} 페이지 약관으로 판단되어 JPG 저장 생략",
+                        current_file=file_index,
+                        total_files=total_files,
+                        current_page=page_number,
+                        total_pages=total_pages,
+                    )
+                )
+                del page
+                del page_text
+                continue
+            if should_skip_dense_text:
+                progress_callback(
+                    ProgressEvent(
+                        event_type="page",
+                        message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
                         current_file=file_index,
                         total_files=total_files,
                         current_page=page_number,
@@ -1805,16 +1823,27 @@ def convert_pdf_quick(pdf_path: Path, file_index: int, total_files: int, progres
                     page_text = normalize_document_text(page.get_text())
                 except Exception:
                     page_text = ""
-                should_skip_terms = (
-                    page_index >= 1
-                    and bool(page_text.strip())
-                    and is_terms_page(page_text)
-                )
+                should_skip_terms = bool(page_text.strip()) and is_terms_page(page_text)
+                should_skip_dense_text = is_dense_small_text_page(page)
                 if should_skip_terms:
                     progress_callback(
                         ProgressEvent(
                             event_type="page",
                             message=f"{pdf_path.name} {page_number}/{total_pages} 페이지 약관으로 판단되어 JPG 저장 생략",
+                            current_file=file_index,
+                            total_files=total_files,
+                            current_page=page_number,
+                            total_pages=total_pages,
+                        )
+                    )
+                    del page
+                    del page_text
+                    continue
+                if should_skip_dense_text:
+                    progress_callback(
+                        ProgressEvent(
+                            event_type="page",
+                            message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
                             current_file=file_index,
                             total_files=total_files,
                             current_page=page_number,
