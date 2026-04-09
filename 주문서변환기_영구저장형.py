@@ -1924,6 +1924,7 @@ class PdfToJpgApp(ctk.CTk):
         self.mode_var = tk.StringVar(value=ANALYSIS_MODE)
         self.show_advanced_filter = False
         self.is_left_panel_collapsed = False
+        self.ui_ready = False
         self.session_company_memory: Dict[str, str] = self.load_persistent_company_memory()
         self.company_banned_tokens, self.po_banned_tokens = self.load_banned_tokens()
         set_banned_tokens(self.company_banned_tokens, self.po_banned_tokens)
@@ -2051,7 +2052,6 @@ class PdfToJpgApp(ctk.CTk):
         )
         self.global_toggle_button.grid(row=0, column=6, rowspan=2, padx=(0, 20), pady=18)
         self.setup_drag_and_drop()
-        self.apply_mode_ui()
 
         self.left_panel = ctk.CTkFrame(shell, fg_color="#fffaf6", corner_radius=24)
         self.left_panel.grid(row=2, column=0, padx=(24, 10), pady=(0, 24), sticky="nsew")
@@ -2341,6 +2341,8 @@ class PdfToJpgApp(ctk.CTk):
         self.advanced_filter_frame.grid_remove()
         self._populate_empty_selection_state()
         self.update_memory_status()
+        self.ui_ready = True
+        self.apply_mode_ui()
 
     def _make_action_button(self, parent, text: str, command, fg_color: str, hover_color: str) -> ctk.CTkButton:
         return ctk.CTkButton(
@@ -3134,6 +3136,8 @@ class PdfToJpgApp(ctk.CTk):
         self.apply_mode_ui()
 
     def apply_mode_ui(self) -> None:
+        if not self.ui_ready:
+            return
         if self.is_quick_mode():
             self.analyze_button.grid_remove()
             self.export_button.grid_remove()
