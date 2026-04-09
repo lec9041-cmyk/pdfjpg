@@ -1448,14 +1448,39 @@ def fit_image_to_canvas(image: Image.Image) -> Image.Image:
     return canvas
 
 
+def build_unique_jpg_name(
+    output_dir: Path,
+    company_name: str,
+    document_date: str,
+    order_number: str,
+    page_number: int,
+    pdf_stem: str,
+) -> str:
+    base_name = f"{company_name}-{document_date}-{order_number}-{page_number}"
+    candidate_name = f"{base_name}.jpg"
+    if not (output_dir / candidate_name).exists():
+        return candidate_name
+
+    stem_token = sanitize_filename_part(pdf_stem)
+    candidate_name = f"{base_name}-{stem_token}.jpg"
+    if not (output_dir / candidate_name).exists():
+        return candidate_name
+
+    duplicate_index = 2
+    while True:
+        candidate_name = f"{base_name}-{stem_token}-{duplicate_index}.jpg"
+        if not (output_dir / candidate_name).exists():
+            return candidate_name
+        duplicate_index += 1
+
+
 def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, progress_callback) -> None:
     pdf_path = document_info.pdf_path
-    output_dir = pdf_path.parent / f"{pdf_path.stem}_jpg"
-    output_dir.mkdir(exist_ok=True)
-
-    company_name = sanitize_filename_part(document_info.company_name)
+    company_name = sanitize_filename_part(document_info.company_name or MISSING_VALUE)
     document_date = sanitize_filename_part(document_info.document_date)
     order_number = sanitize_filename_part(document_info.representative_order_number)
+    output_dir = pdf_path.parent / company_name
+    output_dir.mkdir(exist_ok=True)
 
     with fitz.open(pdf_path) as document:
         total_pages = len(document)
@@ -1503,7 +1528,14 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
 
             image = render_page_to_image(page)
             final_image = fit_image_to_canvas(image)
-            output_name = f"{company_name}-{document_date}-{order_number}-{page_number}.jpg"
+            output_name = build_unique_jpg_name(
+                output_dir=output_dir,
+                company_name=company_name,
+                document_date=document_date,
+                order_number=order_number,
+                page_number=page_number,
+                pdf_stem=pdf_path.stem,
+            )
             final_image.save(output_dir / output_name, "JPEG", quality=95)
 
 
