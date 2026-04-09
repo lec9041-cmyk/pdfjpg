@@ -49,7 +49,8 @@ ORDER_LABEL_PATTERNS = [
 GENERIC_ORDER_FALLBACK = re.compile(r"\b[A-Z]{1,6}(?:[-/]\d+|\d+)(?:[-/]\d+)?\b")
 PO_CODE_PATTERN = re.compile(r"\b[A-Z0-9][A-Z0-9\-/]{4,19}\b")
 PO_ALLOWED_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\-/]{4,19}$")
-DISALLOWED_PO_TOKENS = {"shall", "upon", "terms", "conditions", "delivery", "acceptance"}
+DEFAULT_PO_BANNED_TOKENS = {"shall", "upon", "terms", "conditions", "delivery", "acceptance", "material", "item"}
+DISALLOWED_PO_TOKENS = set(DEFAULT_PO_BANNED_TOKENS)
 COMPANY_LABEL_EXCLUDE = {"company", "supplier", "vendor", "contact person", "telephone"}
 STRICT_COMPANY_BANNED_TOKENS = {
     "tel", "fax", "telephone", "phone", "mobile", "contact person",
@@ -57,6 +58,7 @@ STRICT_COMPANY_BANNED_TOKENS = {
     "requester", "requestor", "requester name", "buyer", "customer", "consignee",
     "ship to", "bill to", "deliver to", "delivery to", "contact", "attn",
 }
+DEFAULT_COMPANY_BANNED_TOKENS = set(STRICT_COMPANY_BANNED_TOKENS)
 HEADER_COMPANY_EXCLUDE_TOKENS = {
     "buyer", "customer", "consignee", "requester", "requestor", "requester name",
     "ship to", "bill to", "deliver to", "delivery to",
@@ -169,6 +171,22 @@ class ProgressEvent:
 def sanitize_filename_part(text: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]+', "_", text.strip())
     return cleaned or MISSING_VALUE
+
+
+def set_banned_tokens(company_tokens: List[str], po_tokens: List[str]) -> None:
+    global STRICT_COMPANY_BANNED_TOKENS, DISALLOWED_PO_TOKENS
+    normalized_company = {
+        token.strip().lower()
+        for token in company_tokens
+        if token and token.strip()
+    }
+    normalized_po = {
+        token.strip().lower()
+        for token in po_tokens
+        if token and token.strip()
+    }
+    STRICT_COMPANY_BANNED_TOKENS = normalized_company or set(DEFAULT_COMPANY_BANNED_TOKENS)
+    DISALLOWED_PO_TOKENS = normalized_po or set(DEFAULT_PO_BANNED_TOKENS)
 
 
 
@@ -417,7 +435,8 @@ def clean_company_candidate(candidate: str) -> str:
 
 def has_hard_banned_company_marker(candidate: str) -> bool:
     lowered = candidate.lower()
-    return any(token in lowered for token in ["fax", "tel", "telephone", "phone", "mobile", "vendor code", "supplier code", "contact"])
+    base_markers = ["fax", "tel", "telephone", "phone", "mobile", "vendor code", "supplier code", "contact"]
+    return any(token in lowered for token in [*base_markers, *STRICT_COMPANY_BANNED_TOKENS])
 
 
 def is_plausible_company_candidate(candidate: str) -> bool:
@@ -1511,6 +1530,7 @@ class PdfToJpgApp(ctk.CTk):
         self.companies_path = self.script_dir / "companies.txt"
         self.company_rules_csv_path = self.script_dir / "companies_rules.csv"
         self.company_mapping_path = self.script_dir / "company_mapping.json"
+        self.banned_tokens_path = self.script_dir / "banned_tokens.json"
         self.selected_folder: Optional[Path] = None
         self.selected_inputs: List[Path] = []
         self.worker_thread: Optional[threading.Thread] = None
@@ -1528,6 +1548,8 @@ class PdfToJpgApp(ctk.CTk):
         self.filter_value_var = tk.StringVar(value="전체")
         self.is_left_panel_collapsed = False
         self.session_company_memory: Dict[str, str] = self.load_persistent_company_memory()
+        self.company_banned_tokens, self.po_banned_tokens = self.load_banned_tokens()
+        set_banned_tokens(self.company_banned_tokens, self.po_banned_tokens)
 
         self._build_ui()
         self.after(100, self.process_event_queue)
@@ -1877,6 +1899,20 @@ class PdfToJpgApp(ctk.CTk):
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
         self.mapping_manage_button.grid(row=2, column=3, padx=(0, 14), pady=(0, 12), sticky="ew")
+
+        self.banned_tokens_button = ctk.CTkButton(
+            preview_frame,
+            text="금지어 관리",
+            command=self.open_banned_tokens_manager,
+            width=120,
+            height=34,
+            corner_radius=14,
+            fg_color="#9c7f64",
+            hover_color="#876c53",
+            text_color="#fffaf6",
+            font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
+        )
+        self.banned_tokens_button.grid(row=2, column=4, padx=(0, 14), pady=(0, 12), sticky="ew")
 
         self.memory_status_label = ctk.CTkLabel(
             preview_frame,
@@ -2306,6 +2342,164 @@ class PdfToJpgApp(ctk.CTk):
         raw_json = json.dumps(self.session_company_memory, ensure_ascii=False, indent=2)
         self.company_mapping_path.write_text(raw_json, encoding="utf-8")
 
+    def load_banned_tokens(self) -> Tuple[List[str], List[str]]:
+        company_defaults = sorted(DEFAULT_COMPANY_BANNED_TOKENS)
+        po_defaults = sorted(DEFAULT_PO_BANNED_TOKENS)
+        try:
+            if not self.banned_tokens_path.exists():
+                payload = {
+                    "company_banned": company_defaults,
+                    "po_banned": po_defaults,
+                }
+                self.banned_tokens_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                return company_defaults, po_defaults
+            loaded = json.loads(self.banned_tokens_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                return company_defaults, po_defaults
+            company_tokens = loaded.get("company_banned", [])
+            po_tokens = loaded.get("po_banned", [])
+            if not isinstance(company_tokens, list):
+                company_tokens = company_defaults
+            if not isinstance(po_tokens, list):
+                po_tokens = po_defaults
+            company_values = sorted({str(token).strip().lower() for token in company_tokens if str(token).strip()})
+            po_values = sorted({str(token).strip().lower() for token in po_tokens if str(token).strip()})
+            return (company_values or company_defaults), (po_values or po_defaults)
+        except Exception:
+            return company_defaults, po_defaults
+
+    def save_banned_tokens(self) -> None:
+        payload = {
+            "company_banned": sorted({token.strip().lower() for token in self.company_banned_tokens if token.strip()}),
+            "po_banned": sorted({token.strip().lower() for token in self.po_banned_tokens if token.strip()}),
+        }
+        self.banned_tokens_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.company_banned_tokens = payload["company_banned"]
+        self.po_banned_tokens = payload["po_banned"]
+        set_banned_tokens(self.company_banned_tokens, self.po_banned_tokens)
+
+    def open_banned_tokens_manager(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("금지어 관리")
+        dialog.geometry("980x560")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.grid_columnconfigure((0, 1), weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            dialog,
+            text="회사명/PO번호 금지어 관리",
+            font=ctk.CTkFont(family="Malgun Gothic", size=18, weight="bold"),
+            text_color="#3f2f2b",
+        ).grid(row=0, column=0, columnspan=2, padx=16, pady=(14, 8), sticky="w")
+
+        def build_list_panel(parent, title: str, column: int, initial_items: List[str]):
+            frame = ctk.CTkFrame(parent, fg_color="#fffaf6", corner_radius=12)
+            frame.grid(row=1, column=column, padx=(16 if column == 0 else 8, 16 if column == 1 else 8), pady=(0, 10), sticky="nsew")
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(1, weight=1)
+
+            ctk.CTkLabel(frame, text=title, font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold"), text_color="#4a3f35").grid(
+                row=0, column=0, padx=12, pady=(10, 8), sticky="w"
+            )
+
+            tree = ttk.Treeview(frame, columns=("token",), show="headings", height=12)
+            tree.heading("token", text="금지어")
+            tree.column("token", width=360, anchor="w")
+            tree.grid(row=1, column=0, padx=(12, 0), pady=(0, 10), sticky="nsew")
+
+            scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            scrollbar.grid(row=1, column=1, pady=(0, 10), padx=(0, 12), sticky="ns")
+            tree.configure(yscrollcommand=scrollbar.set)
+
+            entry_var = tk.StringVar()
+            ctk.CTkEntry(frame, textvariable=entry_var, height=34).grid(row=2, column=0, padx=12, pady=(0, 8), sticky="ew")
+
+            items = sorted({value.strip().lower() for value in initial_items if value and value.strip()})
+
+            def refresh_tree() -> None:
+                tree.delete(*tree.get_children())
+                for value in items:
+                    tree.insert("", "end", values=(value,))
+
+            def load_selected(_event=None) -> None:
+                selected = tree.selection()
+                if not selected:
+                    return
+                values = tree.item(selected[0], "values")
+                entry_var.set(values[0] if values else "")
+
+            def add_item() -> None:
+                value = entry_var.get().strip().lower()
+                if not value:
+                    return
+                if value not in items:
+                    items.append(value)
+                    items.sort()
+                refresh_tree()
+
+            def update_item() -> None:
+                selected = tree.selection()
+                if not selected:
+                    return
+                old_value = tree.item(selected[0], "values")[0]
+                new_value = entry_var.get().strip().lower()
+                if not new_value:
+                    return
+                if old_value in items:
+                    items.remove(old_value)
+                if new_value not in items:
+                    items.append(new_value)
+                items.sort()
+                refresh_tree()
+
+            def delete_item() -> None:
+                selected = tree.selection()
+                if not selected:
+                    return
+                value = tree.item(selected[0], "values")[0]
+                if value in items:
+                    items.remove(value)
+                entry_var.set("")
+                refresh_tree()
+
+            button_row = ctk.CTkFrame(frame, fg_color="transparent")
+            button_row.grid(row=3, column=0, padx=12, pady=(0, 12), sticky="ew")
+            button_row.grid_columnconfigure((0, 1, 2), weight=1)
+            ctk.CTkButton(button_row, text="추가", command=add_item).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+            ctk.CTkButton(button_row, text="수정", command=update_item).grid(row=0, column=1, padx=6, sticky="ew")
+            ctk.CTkButton(button_row, text="삭제", command=delete_item, fg_color="#c97b63", hover_color="#b56750").grid(
+                row=0, column=2, padx=(6, 0), sticky="ew"
+            )
+
+            tree.bind("<<TreeviewSelect>>", load_selected)
+            refresh_tree()
+            return items
+
+        company_items = build_list_panel(dialog, "회사명 금지어", 0, self.company_banned_tokens)
+        po_items = build_list_panel(dialog, "PO번호 금지어", 1, self.po_banned_tokens)
+
+        def save_and_close() -> None:
+            self.company_banned_tokens = sorted({value.strip().lower() for value in company_items if value.strip()})
+            self.po_banned_tokens = sorted({value.strip().lower() for value in po_items if value.strip()})
+            self.save_banned_tokens()
+            self.append_log(
+                f"[금지어저장] 회사명 {len(self.company_banned_tokens)}개 / PO {len(self.po_banned_tokens)}개 ({self.banned_tokens_path.name})"
+            )
+            dialog.destroy()
+            messagebox.showinfo("저장 완료", "금지어 목록을 저장했습니다.")
+
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.grid(row=2, column=0, columnspan=2, padx=16, pady=(0, 16), sticky="ew")
+        footer.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(footer, text="저장", command=save_and_close, fg_color="#6e9f87", hover_color="#5b8b75").grid(
+            row=0, column=0, padx=(0, 8), sticky="ew"
+        )
+        ctk.CTkButton(footer, text="닫기", command=dialog.destroy, fg_color="#b0a89f", hover_color="#9b938a").grid(
+            row=0, column=1, padx=(8, 0), sticky="ew"
+        )
+
     def save_last_memory_export(self, export_text: str) -> None:
         if not export_text.strip() or winreg is None:
             return
@@ -2502,6 +2696,7 @@ class PdfToJpgApp(ctk.CTk):
         self.analyze_button.configure(state=state)
         self.convert_button.configure(state=state)
         self.export_button.configure(state=state)
+        self.banned_tokens_button.configure(state=state)
 
     def start_analysis(self) -> None:
         if self.is_running:
