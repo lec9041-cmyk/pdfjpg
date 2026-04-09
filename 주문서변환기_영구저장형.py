@@ -945,6 +945,29 @@ def lookup_company_mapping(mapping: Dict[str, str], source_name: str) -> str:
     return ""
 
 
+def find_company_mapping_in_pdf_text(mapping: Dict[str, str], search_texts: List[str]) -> Tuple[str, str]:
+    if not mapping:
+        return "", ""
+    normalized_haystack = normalize_for_match(" ".join([text for text in search_texts if text]))
+    if not normalized_haystack:
+        return "", ""
+
+    sorted_mapping = sorted(
+        ((str(key).strip(), str(value).strip()) for key, value in mapping.items()),
+        key=lambda item: len(normalize_for_match(item[0])),
+        reverse=True,
+    )
+    for raw_key, mapped_value in sorted_mapping:
+        if not raw_key or not mapped_value:
+            continue
+        normalized_key = normalize_for_match(raw_key)
+        if not normalized_key:
+            continue
+        if normalized_key in normalized_haystack and not is_excluded_company_name(mapped_value):
+            return mapped_value, raw_key
+    return "", ""
+
+
 def extract_document_date(full_text: str, filename: str) -> str:
     for pattern in DATE_LABEL_PATTERNS:
         match = pattern.search(full_text)
@@ -1023,6 +1046,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
 
         first_page = document.load_page(0) if page_count else None
         top_text = ""
+        first_page_blocks_text = ""
         block_result: Dict[str, object] = {"company_name": "", "order_numbers": [], "document_date": ""}
         if first_page is not None:
             rect = first_page.rect
@@ -1032,17 +1056,36 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             except Exception:
                 top_text = ""
             try:
+                raw_blocks = first_page.get_text("blocks")
+                first_page_blocks_text = normalize_document_text(
+                    "\n".join([str(block[4]).strip() for block in raw_blocks if len(block) >= 5 and str(block[4]).strip()])
+                )
+            except Exception:
+                first_page_blocks_text = ""
+            try:
                 block_result = extract_from_blocks(first_page)
             except Exception:
                 block_result = {"company_name": "", "order_numbers": [], "document_date": ""}
 
         text_mode_enough = len(re.sub(r"\s+", "", top_text)) >= 120
         working_text = top_text if text_mode_enough else ""
+
+        mapped_company = ""
+        mapped_key = ""
+        if session_company_memory:
+            mapped_company, mapped_key = find_company_mapping_in_pdf_text(
+                session_company_memory,
+                [top_text, full_text, first_page_blocks_text],
+            )
+
         merged_for_alias = normalize_document_text("\n".join([part for part in [top_text, full_text] if part.strip()]))
         detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_for_alias, company_rules, session_company_memory)
         block_company = str(block_result.get("company_name", "")).strip()
-        company_name = block_company
-        if not company_name and detected_company != MISSING_VALUE and company_source == "session-memory":
+        company_name = mapped_company or block_company
+        if mapped_company:
+            matched_alias = mapped_key
+            company_source = "session-memory-direct"
+        elif not company_name and detected_company != MISSING_VALUE and company_source == "session-memory":
             company_name = detected_company
         if not company_name:
             company_name = MISSING_VALUE
@@ -1070,9 +1113,23 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             if ocr_text.strip():
                 used_ocr = True
                 merged_top_text = normalize_document_text("\n".join(part for part in [working_text, ocr_text] if part.strip()))
-                detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_top_text, company_rules, session_company_memory)
-                if company_name == MISSING_VALUE and detected_company != MISSING_VALUE and company_source == "session-memory":
-                    company_name = detected_company
+                detected_company, detected_alias, detected_source, _auto_candidates = detect_company_name(
+                    merged_top_text, company_rules, session_company_memory
+                )
+                if company_name == MISSING_VALUE:
+                    if session_company_memory:
+                        mapped_company, mapped_key = find_company_mapping_in_pdf_text(
+                            session_company_memory,
+                            [merged_top_text, full_text, first_page_blocks_text],
+                        )
+                        if mapped_company:
+                            company_name = mapped_company
+                            matched_alias = mapped_key
+                            company_source = "session-memory-direct"
+                    if company_name == MISSING_VALUE and detected_company != MISSING_VALUE and detected_source == "session-memory":
+                        company_name = detected_company
+                        matched_alias = detected_alias
+                        company_source = detected_source
 
                 merged_scan_text = normalize_document_text("\n".join(part for part in [merged_top_text, full_text] if part.strip()))
                 regex_orders = [
@@ -1101,7 +1158,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
     company_match_status = "회사명매칭성공" if company_name != MISSING_VALUE else "회사명매칭실패"
     if company_name != MISSING_VALUE and company_source == "auto-detected":
         company_match_status = "회사명자동추출"
-    elif company_name != MISSING_VALUE and company_source == "session-memory":
+    elif company_name != MISSING_VALUE and company_source in {"session-memory", "session-memory-direct"}:
         company_match_status = "회사명메모리적용"
 
     return DocumentInfo(
