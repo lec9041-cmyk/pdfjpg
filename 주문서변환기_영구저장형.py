@@ -14,6 +14,7 @@ import customtkinter as ctk
 import fitz  # PyMuPDF
 from PIL import Image
 from tkinter import filedialog, messagebox
+from tkinter import ttk
 
 try:
     import winreg
@@ -52,8 +53,14 @@ COMPANY_LABEL_EXCLUDE = {"company", "supplier", "vendor", "contact person", "tel
 STRICT_COMPANY_BANNED_TOKENS = {
     "tel", "fax", "telephone", "phone", "mobile", "contact person",
     "vendor code", "supplier code", "code:", "email", "@", "http", "www",
+    "requester", "requestor", "requester name", "buyer", "customer", "consignee",
+    "ship to", "bill to", "deliver to", "delivery to", "contact", "attn",
 }
-HEADER_COMPANY_EXCLUDE_TOKENS = {"buyer", "contact", "attn", "tel", "fax", "email", "@", "phone", "mobile"}
+HEADER_COMPANY_EXCLUDE_TOKENS = {
+    "buyer", "customer", "consignee", "requester", "requestor", "requester name",
+    "ship to", "bill to", "deliver to", "delivery to",
+    "contact", "attn", "tel", "fax", "email", "@", "phone", "mobile",
+}
 TERMS_KEYWORDS = {
     "terms", "conditions", "delivery", "acceptance", "warranty", "liability",
     "agreement", "payment", "shall", "upon",
@@ -91,6 +98,7 @@ COMPANY_STOPWORDS = {
     "purchase order", "order sheet", "invoice", "quotation", "견적서", "발주서", "주문서", "거래명세서",
     "packing list", "commercial invoice", "proforma invoice", "ship to", "bill to", "buyer", "seller",
     "vendor", "supplier", "customer", "consignee", "notify", "attn", "tel", "fax", "email", "address",
+    "requester", "requestor", "requester name", "contact", "deliver to", "delivery to",
 }
 AUTO_COMPANY_LABEL_PATTERNS = [
     re.compile(r"(?:supplier|vendor|seller|maker|manufacturer|from)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
@@ -937,6 +945,29 @@ def lookup_company_mapping(mapping: Dict[str, str], source_name: str) -> str:
     return ""
 
 
+def find_company_mapping_in_pdf_text(mapping: Dict[str, str], search_texts: List[str]) -> Tuple[str, str]:
+    if not mapping:
+        return "", ""
+    normalized_haystack = normalize_for_match(" ".join([text for text in search_texts if text]))
+    if not normalized_haystack:
+        return "", ""
+
+    sorted_mapping = sorted(
+        ((str(key).strip(), str(value).strip()) for key, value in mapping.items()),
+        key=lambda item: len(normalize_for_match(item[0])),
+        reverse=True,
+    )
+    for raw_key, mapped_value in sorted_mapping:
+        if not raw_key or not mapped_value:
+            continue
+        normalized_key = normalize_for_match(raw_key)
+        if not normalized_key:
+            continue
+        if normalized_key in normalized_haystack and not is_excluded_company_name(mapped_value):
+            return mapped_value, raw_key
+    return "", ""
+
+
 def extract_document_date(full_text: str, filename: str) -> str:
     for pattern in DATE_LABEL_PATTERNS:
         match = pattern.search(full_text)
@@ -1015,6 +1046,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
 
         first_page = document.load_page(0) if page_count else None
         top_text = ""
+        first_page_blocks_text = ""
         block_result: Dict[str, object] = {"company_name": "", "order_numbers": [], "document_date": ""}
         if first_page is not None:
             rect = first_page.rect
@@ -1024,17 +1056,36 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             except Exception:
                 top_text = ""
             try:
+                raw_blocks = first_page.get_text("blocks")
+                first_page_blocks_text = normalize_document_text(
+                    "\n".join([str(block[4]).strip() for block in raw_blocks if len(block) >= 5 and str(block[4]).strip()])
+                )
+            except Exception:
+                first_page_blocks_text = ""
+            try:
                 block_result = extract_from_blocks(first_page)
             except Exception:
                 block_result = {"company_name": "", "order_numbers": [], "document_date": ""}
 
         text_mode_enough = len(re.sub(r"\s+", "", top_text)) >= 120
         working_text = top_text if text_mode_enough else ""
+
+        mapped_company = ""
+        mapped_key = ""
+        if session_company_memory:
+            mapped_company, mapped_key = find_company_mapping_in_pdf_text(
+                session_company_memory,
+                [top_text, full_text, first_page_blocks_text],
+            )
+
         merged_for_alias = normalize_document_text("\n".join([part for part in [top_text, full_text] if part.strip()]))
         detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_for_alias, company_rules, session_company_memory)
         block_company = str(block_result.get("company_name", "")).strip()
-        company_name = block_company
-        if not company_name and detected_company != MISSING_VALUE and company_source == "session-memory":
+        company_name = mapped_company or block_company
+        if mapped_company:
+            matched_alias = mapped_key
+            company_source = "session-memory-direct"
+        elif not company_name and detected_company != MISSING_VALUE and company_source == "session-memory":
             company_name = detected_company
         if not company_name:
             company_name = MISSING_VALUE
@@ -1062,9 +1113,23 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             if ocr_text.strip():
                 used_ocr = True
                 merged_top_text = normalize_document_text("\n".join(part for part in [working_text, ocr_text] if part.strip()))
-                detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_top_text, company_rules, session_company_memory)
-                if company_name == MISSING_VALUE and detected_company != MISSING_VALUE and company_source == "session-memory":
-                    company_name = detected_company
+                detected_company, detected_alias, detected_source, _auto_candidates = detect_company_name(
+                    merged_top_text, company_rules, session_company_memory
+                )
+                if company_name == MISSING_VALUE:
+                    if session_company_memory:
+                        mapped_company, mapped_key = find_company_mapping_in_pdf_text(
+                            session_company_memory,
+                            [merged_top_text, full_text, first_page_blocks_text],
+                        )
+                        if mapped_company:
+                            company_name = mapped_company
+                            matched_alias = mapped_key
+                            company_source = "session-memory-direct"
+                    if company_name == MISSING_VALUE and detected_company != MISSING_VALUE and detected_source == "session-memory":
+                        company_name = detected_company
+                        matched_alias = detected_alias
+                        company_source = detected_source
 
                 merged_scan_text = normalize_document_text("\n".join(part for part in [merged_top_text, full_text] if part.strip()))
                 regex_orders = [
@@ -1093,7 +1158,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
     company_match_status = "회사명매칭성공" if company_name != MISSING_VALUE else "회사명매칭실패"
     if company_name != MISSING_VALUE and company_source == "auto-detected":
         company_match_status = "회사명자동추출"
-    elif company_name != MISSING_VALUE and company_source == "session-memory":
+    elif company_name != MISSING_VALUE and company_source in {"session-memory", "session-memory-direct"}:
         company_match_status = "회사명메모리적용"
 
     return DocumentInfo(
@@ -1489,6 +1554,7 @@ class PdfToJpgApp(ctk.CTk):
         preview_frame.grid_columnconfigure(1, weight=0)
         preview_frame.grid_columnconfigure(2, weight=0)
         preview_frame.grid_columnconfigure(3, weight=0)
+        preview_frame.grid_columnconfigure(4, weight=0)
 
         ctk.CTkLabel(
             preview_frame,
@@ -1564,6 +1630,20 @@ class PdfToJpgApp(ctk.CTk):
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
         self.memory_import_button.grid(row=2, column=2, padx=(0, 14), pady=(0, 12), sticky="ew")
+
+        self.mapping_manage_button = ctk.CTkButton(
+            preview_frame,
+            text="회사명 매핑 관리",
+            command=self.open_company_mapping_manager,
+            width=140,
+            height=34,
+            corner_radius=14,
+            fg_color="#5f8da8",
+            hover_color="#507a93",
+            text_color="#fffaf6",
+            font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
+        )
+        self.mapping_manage_button.grid(row=2, column=3, padx=(0, 14), pady=(0, 12), sticky="ew")
 
         self.memory_status_label = ctk.CTkLabel(
             preview_frame,
@@ -1818,6 +1898,142 @@ class PdfToJpgApp(ctk.CTk):
         ctk.CTkButton(button_row, text="닫기", command=dialog.destroy, fg_color="#b0a89f", hover_color="#9b938a").grid(
             row=0, column=1, padx=(8, 0), sticky="ew"
         )
+
+    def open_company_mapping_manager(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("회사명 매핑 관리")
+        dialog.geometry("860x520")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            dialog,
+            text="회사명 매핑 관리",
+            font=ctk.CTkFont(family="Malgun Gothic", size=18, weight="bold"),
+            text_color="#3f2f2b",
+        ).grid(row=0, column=0, padx=16, pady=(14, 8), sticky="w")
+
+        table_frame = ctk.CTkFrame(dialog, fg_color="#fffaf6", corner_radius=12)
+        table_frame.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="nsew")
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(0, weight=1)
+
+        columns = ("po_company", "target_company")
+        mapping_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=14)
+        mapping_tree.heading("po_company", text="PO상 회사명")
+        mapping_tree.heading("target_company", text="내가 쓸 회사명")
+        mapping_tree.column("po_company", width=380, anchor="w")
+        mapping_tree.column("target_company", width=380, anchor="w")
+        mapping_tree.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
+
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=mapping_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=10)
+        mapping_tree.configure(yscrollcommand=scrollbar.set)
+
+        form_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        form_frame.grid(row=2, column=0, padx=16, pady=(0, 8), sticky="ew")
+        form_frame.grid_columnconfigure(1, weight=1)
+        form_frame.grid_columnconfigure(3, weight=1)
+
+        po_company_var = tk.StringVar()
+        target_company_var = tk.StringVar()
+
+        ctk.CTkLabel(form_frame, text="PO상 회사명", font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold")).grid(
+            row=0, column=0, padx=(0, 8), pady=6, sticky="w"
+        )
+        ctk.CTkEntry(form_frame, textvariable=po_company_var, height=34).grid(
+            row=0, column=1, padx=(0, 12), pady=6, sticky="ew"
+        )
+        ctk.CTkLabel(form_frame, text="내가 쓸 회사명", font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold")).grid(
+            row=0, column=2, padx=(0, 8), pady=6, sticky="w"
+        )
+        ctk.CTkEntry(form_frame, textvariable=target_company_var, height=34).grid(
+            row=0, column=3, padx=(0, 0), pady=6, sticky="ew"
+        )
+
+        button_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        button_row.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="ew")
+        button_row.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+
+        def refresh_tree() -> None:
+            mapping_tree.delete(*mapping_tree.get_children())
+            for key, value in sorted(self.session_company_memory.items(), key=lambda item: (item[0].lower(), item[1].lower())):
+                mapping_tree.insert("", "end", values=(key, value))
+
+        def read_form_values() -> Tuple[str, str]:
+            return po_company_var.get().strip(), target_company_var.get().strip()
+
+        def load_selected_row(_event=None) -> None:
+            selected = mapping_tree.selection()
+            if not selected:
+                return
+            values = mapping_tree.item(selected[0], "values")
+            po_company_var.set(values[0])
+            target_company_var.set(values[1])
+
+        def add_row() -> None:
+            source_name, target_name = read_form_values()
+            if not source_name or not target_name:
+                messagebox.showwarning("입력 필요", "PO상 회사명과 내가 쓸 회사명을 모두 입력해주세요.")
+                return
+            if is_excluded_company_name(source_name) or is_excluded_company_name(target_name):
+                messagebox.showwarning("등록 불가", "자동 제외 대상 이름은 매핑으로 저장할 수 없습니다.")
+                return
+            self.session_company_memory[source_name] = target_name
+            refresh_tree()
+            self.append_log(f"[매핑추가] {source_name} -> {target_name}")
+
+        def update_row() -> None:
+            selected = mapping_tree.selection()
+            if not selected:
+                messagebox.showwarning("선택 필요", "수정할 행을 먼저 선택해주세요.")
+                return
+            old_key = mapping_tree.item(selected[0], "values")[0]
+            source_name, target_name = read_form_values()
+            if not source_name or not target_name:
+                messagebox.showwarning("입력 필요", "PO상 회사명과 내가 쓸 회사명을 모두 입력해주세요.")
+                return
+            if old_key in self.session_company_memory:
+                del self.session_company_memory[old_key]
+            self.session_company_memory[source_name] = target_name
+            refresh_tree()
+            self.append_log(f"[매핑수정] {old_key} -> {source_name} / {target_name}")
+
+        def delete_row() -> None:
+            selected = mapping_tree.selection()
+            if not selected:
+                messagebox.showwarning("선택 필요", "삭제할 행을 먼저 선택해주세요.")
+                return
+            key = mapping_tree.item(selected[0], "values")[0]
+            if key in self.session_company_memory:
+                del self.session_company_memory[key]
+            po_company_var.set("")
+            target_company_var.set("")
+            refresh_tree()
+            self.append_log(f"[매핑삭제] {key}")
+
+        def save_rows() -> None:
+            self.save_persistent_company_memory()
+            self.update_memory_status()
+            self.append_log(f"[매핑저장] company_mapping.json 반영 ({len(self.session_company_memory)}개)")
+            messagebox.showinfo("저장 완료", f"회사명 매핑 {len(self.session_company_memory)}개를 저장했습니다.")
+
+        ctk.CTkButton(button_row, text="새 행 추가", command=add_row).grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        ctk.CTkButton(button_row, text="선택 행 수정", command=update_row).grid(row=0, column=1, padx=8, sticky="ew")
+        ctk.CTkButton(button_row, text="선택 행 삭제", command=delete_row, fg_color="#c97b63", hover_color="#b56750").grid(
+            row=0, column=2, padx=8, sticky="ew"
+        )
+        ctk.CTkButton(button_row, text="저장", command=save_rows, fg_color="#6e9f87", hover_color="#5b8b75").grid(
+            row=0, column=3, padx=8, sticky="ew"
+        )
+        ctk.CTkButton(button_row, text="닫기", command=dialog.destroy, fg_color="#b0a89f", hover_color="#9b938a").grid(
+            row=0, column=4, padx=(8, 0), sticky="ew"
+        )
+
+        mapping_tree.bind("<<TreeviewSelect>>", load_selected_row)
+        refresh_tree()
 
     def load_persistent_company_memory(self) -> Dict[str, str]:
         memory: Dict[str, str] = {}
