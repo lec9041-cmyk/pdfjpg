@@ -1674,6 +1674,7 @@ class PdfToJpgApp(ctk.CTk):
         self.documents: List[DocumentInfo] = []
         self.selected_company: Optional[str] = None
         self.selection_vars: Dict[str, tk.BooleanVar] = {}
+        self.company_checkboxes: Dict[str, List[tk.BooleanVar]] = {}
         self.selection_checkboxes: Dict[str, ctk.CTkCheckBox] = {}
         self.selection_order: List[str] = []
         self.selection_meta: Dict[str, Tuple[str, str]] = {}
@@ -3117,6 +3118,7 @@ class PdfToJpgApp(ctk.CTk):
             child.destroy()
 
         self.selection_vars.clear()
+        self.company_checkboxes.clear()
         self.selection_checkboxes.clear()
         self.selection_order.clear()
         self.selection_meta.clear()
@@ -3133,13 +3135,43 @@ class PdfToJpgApp(ctk.CTk):
 
         row_index = 0
         for company_name, docs in grouped.items():
+            self.company_checkboxes[company_name] = []
+            header_frame = ctk.CTkFrame(self.selection_frame, fg_color="transparent")
+            header_frame.grid(row=row_index, column=0, padx=12, pady=(8, 2), sticky="ew")
+            header_frame.grid_columnconfigure(0, weight=1)
+
             header_text = f"{company_name}  |  문서 {len(docs)}개"
             ctk.CTkLabel(
-                self.selection_frame,
+                header_frame,
                 text=header_text,
                 font=ctk.CTkFont(family="Malgun Gothic", size=15, weight="bold"),
                 text_color="#4b3d37",
-            ).grid(row=row_index, column=0, padx=12, pady=(8, 2), sticky="w")
+            ).grid(row=0, column=0, sticky="w")
+
+            ctk.CTkButton(
+                header_frame,
+                text="전체선택",
+                width=76,
+                height=28,
+                corner_radius=10,
+                fg_color="#81b29a",
+                hover_color="#6b9b84",
+                text_color="#fffaf6",
+                font=ctk.CTkFont(family="Malgun Gothic", size=11, weight="bold"),
+                command=lambda name=company_name: self.select_all_company(name),
+            ).grid(row=0, column=1, padx=(8, 4), sticky="e")
+            ctk.CTkButton(
+                header_frame,
+                text="해제",
+                width=56,
+                height=28,
+                corner_radius=10,
+                fg_color="#d9b08c",
+                hover_color="#c69b76",
+                text_color="#fffaf6",
+                font=ctk.CTkFont(family="Malgun Gothic", size=11, weight="bold"),
+                command=lambda name=company_name: self.deselect_all_company(name),
+            ).grid(row=0, column=2, sticky="e")
             row_index += 1
 
             doc_dates = sorted({doc.document_date for doc in docs if doc.document_date != MISSING_VALUE})
@@ -3191,6 +3223,7 @@ class PdfToJpgApp(ctk.CTk):
                 edit_button.grid(row=0, column=1, padx=(8, 0), sticky="e")
 
                 self.selection_vars[row_key] = variable
+                self.company_checkboxes[company_name].append(variable)
                 self.selection_checkboxes[row_key] = checkbox
                 self.selection_order.append(row_key)
                 self.selection_meta[row_key] = (company_name, display_number)
@@ -3216,6 +3249,29 @@ class PdfToJpgApp(ctk.CTk):
             selected_keys = [key for key, var in self.selection_vars.items() if var.get()]
             self.selected_company = self.selection_meta[selected_keys[0]][0] if selected_keys else None
 
+        self.update_checkbox_states()
+        self.update_title_preview()
+
+    def select_all_company(self, company_name: str) -> None:
+        variables = self.company_checkboxes.get(company_name, [])
+        if not variables:
+            return
+
+        self.selected_company = company_name
+        for variable in variables:
+            variable.set(True)
+        self.update_checkbox_states()
+        self.update_title_preview()
+
+    def deselect_all_company(self, company_name: str) -> None:
+        variables = self.company_checkboxes.get(company_name, [])
+        if not variables:
+            return
+
+        for variable in variables:
+            variable.set(False)
+        selected_keys = [key for key, var in self.selection_vars.items() if var.get()]
+        self.selected_company = self.selection_meta[selected_keys[0]][0] if selected_keys else None
         self.update_checkbox_states()
         self.update_title_preview()
 
