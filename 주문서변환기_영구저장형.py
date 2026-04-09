@@ -100,6 +100,7 @@ COMPANY_STOPWORDS = {
     "packing list", "commercial invoice", "proforma invoice", "ship to", "bill to", "buyer", "seller",
     "vendor", "supplier", "customer", "consignee", "notify", "attn", "tel", "fax", "email", "address",
     "requester", "requestor", "requester name", "contact", "deliver to", "delivery to",
+    "phone", "mobile", "vendor code", "supplier code",
 }
 AUTO_COMPANY_LABEL_PATTERNS = [
     re.compile(r"(?:supplier|vendor|seller|maker|manufacturer|from)\s*[:：]\s*([^\n]{2,80})", re.IGNORECASE),
@@ -114,6 +115,11 @@ CORPORATE_NAME_LINE_PATTERNS = [
 
 @dataclass
 class CompanyRule:
+    # 업체별 확장 포인트:
+    # - aliases: 회사명 키워드 고정 매핑(동의어/약칭)
+    # - order_patterns: 업체별 PO 패턴 고정 정규식
+    # 향후 CSV 확장 시 header 우선 / vendor 라벨 우선 같은 힌트 컬럼을
+    # 추가해도 본 구조를 유지하며 점진적으로 반영할 수 있다.
     display_name: str
     aliases: List[str] = field(default_factory=list)
     order_patterns: List[re.Pattern] = field(default_factory=list)
@@ -138,8 +144,13 @@ class DocumentInfo:
     used_ocr: bool = False
     company_match_status: str = ""
     raw_order_candidates: List[str] = field(default_factory=list)
+    pdf_order_candidates: List[str] = field(default_factory=list)
+    filename_order_candidates: List[str] = field(default_factory=list)
     matched_alias: str = ""
     company_rule_source: str = ""
+    company_decision_reason: str = ""
+    order_decision_reason: str = ""
+    debug_log_lines: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -175,6 +186,10 @@ def compile_order_patterns(patterns: List[str]) -> List[re.Pattern]:
 
 
 def load_company_rules(companies_path: Path) -> List[CompanyRule]:
+    # companies_rules.csv 우선, 없으면 companies.txt fallback.
+    # 현재는 회사명/별칭/PO패턴 중심으로 로드하며,
+    # 향후 업체별 예외(헤더 우선, Vendor 우선 등)는 CSV 컬럼을
+    # 확장해도 기존 파일 형식을 깨지 않도록 유지한다.
     rules: List[CompanyRule] = []
     csv_path = companies_path.with_name("companies_rules.csv")
 
@@ -857,8 +872,10 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
 
     company_candidates = collect_label_candidates(company_label_patterns, base_score=170)
     vendor_candidates = collect_label_candidates(vendor_label_patterns, base_score=130)
+    company_source = ""
     prioritized = [header_candidates, company_candidates, vendor_candidates]
-    for group in prioritized:
+    source_labels = ["header", "company-label", "vendor/supplier"]
+    for group_index, group in enumerate(prioritized):
         if not group:
             continue
         group.sort(key=lambda item: item[0], reverse=True)
@@ -866,24 +883,63 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
         tied = [item for item in group if abs(item[0] - top_score) <= 8]
         if len(tied) >= 2:
             company_value = ""
+            company_source = ""
         else:
             company_value = group[0][1]
+            company_source = source_labels[group_index]
         break
 
     top_half_blocks = [block for block in blocks if float(block["y0"]) <= top_half_y_limit]
+    nearby_primary_candidates: List[str] = []
+    nearby_right_candidates: List[str] = []
+    nearby_down_candidates: List[str] = []
+    broad_radius_candidates: List[str] = []
     po_label = find_label_block(top_half_blocks, po_label_patterns)
     if po_label is not None:
         nearby_primary = get_nearby_value(po_label, top_half_blocks)
         if nearby_primary:
             for match in PO_CODE_PATTERN.findall(nearby_primary):
                 if is_valid_po_number(match):
-                    po_candidates.append(clean_order_candidate(match))
+                    cleaned = clean_order_candidate(match)
+                    nearby_primary_candidates.append(cleaned)
+                    po_candidates.append(cleaned)
 
-        around: List[str] = []
         px0 = float(po_label["x0"])
         py0 = float(po_label["y0"])
         py1 = float(po_label["y1"])
-        around.extend(
+        line_h = max(12.0, py1 - py0)
+
+        same_line_right = [
+            block for block in top_half_blocks
+            if block is not po_label
+            and float(block["x0"]) >= float(po_label["x1"]) - 3
+            and abs(float(block["y0"]) - py0) <= line_h * 0.6
+        ]
+        same_line_right.sort(key=lambda block: (abs(float(block["y0"]) - py0), float(block["x0"])))
+        for block in same_line_right[:2]:
+            item = str(block["text"]).strip()
+            for match in PO_CODE_PATTERN.findall(item or ""):
+                if is_valid_po_number(match):
+                    cleaned = clean_order_candidate(match)
+                    nearby_right_candidates.append(cleaned)
+                    po_candidates.append(cleaned)
+
+        below_one = [
+            block for block in top_half_blocks
+            if block is not po_label
+            and abs(float(block["x0"]) - px0) <= 120
+            and float(block["y0"]) > py1 - 2
+            and float(block["y0"]) <= py1 + line_h * 3.0
+        ]
+        below_one.sort(key=lambda block: (float(block["y0"]), abs(float(block["x0"]) - px0)))
+        if below_one:
+            for match in PO_CODE_PATTERN.findall(str(below_one[0]["text"]).strip()):
+                if is_valid_po_number(match):
+                    cleaned = clean_order_candidate(match)
+                    nearby_down_candidates.append(cleaned)
+                    po_candidates.append(cleaned)
+
+        broad_area = [
             str(block["text"]).strip()
             for block in top_half_blocks
             if block is not po_label
@@ -891,11 +947,11 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
             and float(block["x0"]) <= px0 + 520
             and float(block["y0"]) >= py0 - 20
             and float(block["y0"]) <= py1 + 90
-        )
-        for item in around:
+        ]
+        for item in broad_area:
             for match in PO_CODE_PATTERN.findall(item or ""):
                 if is_valid_po_number(match):
-                    po_candidates.append(clean_order_candidate(match))
+                    broad_radius_candidates.append(clean_order_candidate(match))
 
     date_label = find_label_block(blocks, date_label_patterns)
     if date_label is not None:
@@ -917,7 +973,15 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
 
     return {
         "company_name": clean_company_candidate(company_value) if company_value else "",
+        "company_source": company_source,
+        "header_candidates": header_candidates,
+        "company_label_candidates": company_candidates,
+        "vendor_label_candidates": vendor_candidates,
         "order_numbers": unique_preserve_order([po for po in po_candidates if is_valid_po_number(po)]),
+        "po_primary_candidates": unique_preserve_order(nearby_primary_candidates),
+        "po_same_line_candidates": unique_preserve_order(nearby_right_candidates),
+        "po_below_candidates": unique_preserve_order(nearby_down_candidates),
+        "po_broad_candidates": unique_preserve_order(broad_radius_candidates),
         "document_date": date_value,
     }
 
@@ -971,6 +1035,60 @@ def find_company_mapping_in_pdf_text(mapping: Dict[str, str], search_texts: List
         if normalized_key in normalized_haystack and not is_excluded_company_name(mapped_value):
             return mapped_value, raw_key
     return "", ""
+
+
+def format_scored_candidates(candidates: List[Tuple[int, str]]) -> str:
+    if not candidates:
+        return "없음"
+    ordered = sorted(candidates, key=lambda item: item[0], reverse=True)
+    return ", ".join(f"{name}({score})" for score, name in ordered[:5])
+
+
+def resolve_company_name(
+    *,
+    mapping: Dict[str, str],
+    top_text: str,
+    full_text: str,
+    first_page_blocks_text: str,
+    block_result: Dict[str, object],
+    ocr_top_text: str = "",
+) -> Tuple[str, str, str, List[str]]:
+    debug_lines: List[str] = []
+    mapped_company, mapped_key = find_company_mapping_in_pdf_text(mapping, [top_text, full_text, first_page_blocks_text])
+    debug_lines.append(f"[회사명후보] JSON direct mapping: {'일치' if bool(mapped_company) else '없음'}")
+    if mapped_company:
+        debug_lines.append(f"[회사명결정] JSON direct match -> {mapped_company}")
+        return mapped_company, mapped_key, "session-memory-direct", debug_lines
+
+    header_candidates = block_result.get("header_candidates", [])
+    company_label_candidates = block_result.get("company_label_candidates", [])
+    vendor_candidates = block_result.get("vendor_label_candidates", [])
+    if isinstance(header_candidates, list):
+        debug_lines.append(f"[회사명후보] header: {format_scored_candidates(header_candidates)}")
+    if isinstance(company_label_candidates, list):
+        debug_lines.append(f"[회사명후보] company-label: {format_scored_candidates(company_label_candidates)}")
+    if isinstance(vendor_candidates, list):
+        debug_lines.append(f"[회사명후보] vendor/supplier: {format_scored_candidates(vendor_candidates)}")
+
+    block_company = str(block_result.get("company_name", "")).strip()
+    if block_company:
+        source = str(block_result.get("company_source", "block"))
+        reason = "header best score" if source == "header" else ("company label best score" if source == "company-label" else "vendor label best score")
+        debug_lines.append(f"[회사명결정] block result ({reason}) -> {block_company}")
+        return block_company, "", "block", debug_lines
+
+    if ocr_top_text.strip():
+        ocr_detected, _ocr_alias, _ocr_source, ocr_candidates = detect_company_name(ocr_top_text, [], mapping)
+        debug_lines.append(f"[회사명후보] OCR-top: {', '.join(ocr_candidates) if ocr_candidates else '없음'}")
+        if ocr_detected != MISSING_VALUE:
+            debug_lines.append(f"[회사명결정] OCR top assist -> {ocr_detected}")
+            return ocr_detected, ocr_detected, "ocr-top-candidate", debug_lines
+        if ocr_candidates:
+            debug_lines.append(f"[회사명결정] OCR top assist -> {ocr_candidates[0]}")
+            return ocr_candidates[0], ocr_candidates[0], "ocr-top-candidate", debug_lines
+
+    debug_lines.append(f"[회사명결정] fallback -> {MISSING_VALUE}")
+    return MISSING_VALUE, "", "", debug_lines
 
 
 def extract_document_date(full_text: str, filename: str) -> str:
@@ -1078,18 +1196,18 @@ def po_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, na, nb).ratio()
 
 
-def resolve_order_candidates_with_filename(pdf_orders: List[str], filename_orders: List[str]) -> Tuple[List[str], str]:
+def resolve_order_candidates_with_filename(pdf_orders: List[str], filename_orders: List[str]) -> Tuple[List[str], str, str, str]:
     pdf_values = unique_preserve_order([clean_order_candidate(value) for value in pdf_orders if value and value != MISSING_VALUE])
     file_values = unique_preserve_order([clean_order_candidate(value) for value in filename_orders if value and value != MISSING_VALUE])
 
     if not pdf_values and not file_values:
-        return [MISSING_VALUE], MISSING_VALUE
+        return [MISSING_VALUE], MISSING_VALUE, "ambiguous", "no-candidate"
     if not pdf_values and file_values:
         preferred = select_representative_order_number(file_values)
-        return file_values, preferred
+        return file_values, preferred, "only filename candidate", "no-pdf-candidate"
     if pdf_values and not file_values:
         preferred = select_representative_order_number(pdf_values)
-        return pdf_values, preferred
+        return pdf_values, preferred, "block/text primary", "no-filename-candidate"
 
     best_pair: Optional[Tuple[str, str]] = None
     best_score = 0.0
@@ -1103,20 +1221,20 @@ def resolve_order_candidates_with_filename(pdf_orders: List[str], filename_order
     if best_pair and best_score >= 0.82:
         preferred = best_pair[0]
         merged = unique_preserve_order([preferred, best_pair[1], *pdf_values, *file_values])
-        return merged, preferred
+        return merged, preferred, "filename similarity matched", f"{best_pair[0]}~{best_pair[1]}={best_score:.3f}"
 
     if len(file_values) == 1:
         preferred = file_values[0]
         merged = unique_preserve_order([preferred, *pdf_values, *file_values])
-        return merged, preferred
+        return merged, preferred, "only filename candidate", f"best-similarity={best_score:.3f}"
 
     if len(pdf_values) == 1 and len(file_values) > 1:
         preferred = pdf_values[0]
         merged = unique_preserve_order([preferred, *file_values, *pdf_values])
-        return merged, preferred
+        return merged, preferred, "block primary", f"best-similarity={best_score:.3f}"
 
     merged = unique_preserve_order([*pdf_values, *file_values])
-    return merged, MISSING_VALUE
+    return merged, MISSING_VALUE, "ambiguous", f"best-similarity={best_score:.3f}"
 
 
 
@@ -1158,28 +1276,26 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         text_mode_enough = len(re.sub(r"\s+", "", top_text)) >= 120
         working_text = top_text if text_mode_enough else ""
         resolved_representative_order = MISSING_VALUE
+        order_decision_reason = "ambiguous"
+        pdf_order_candidates: List[str] = []
+        filename_orders: List[str] = []
+        matched_alias = ""
+        company_source = ""
+        debug_log_lines: List[str] = []
 
-        mapped_company = ""
-        mapped_key = ""
-        if session_company_memory:
-            mapped_company, mapped_key = find_company_mapping_in_pdf_text(
-                session_company_memory,
-                [top_text, full_text, first_page_blocks_text],
-            )
-
-        merged_for_alias = normalize_document_text("\n".join([part for part in [top_text, full_text] if part.strip()]))
-        detected_company, matched_alias, company_source, _auto_candidates = detect_company_name(merged_for_alias, company_rules, session_company_memory)
-        block_company = str(block_result.get("company_name", "")).strip()
-        company_name = mapped_company or block_company
-        if mapped_company:
-            matched_alias = mapped_key
-            company_source = "session-memory-direct"
-        elif not company_name and detected_company != MISSING_VALUE and company_source == "session-memory":
-            company_name = detected_company
-        if not company_name:
-            company_name = MISSING_VALUE
-            matched_alias = ""
-            company_source = ""
+        mapping_source = session_company_memory or {}
+        company_name, matched_alias, company_source, company_debug = resolve_company_name(
+            mapping=mapping_source,
+            top_text=top_text,
+            full_text=full_text,
+            first_page_blocks_text=first_page_blocks_text,
+            block_result=block_result,
+        )
+        debug_log_lines.extend(company_debug)
+        company_decision_reason = (
+            "JSON direct match" if company_source == "session-memory-direct"
+            else ("block result" if company_source == "block" else ("OCR top assist" if company_source == "ocr-top-candidate" else "확인필요"))
+        )
 
         block_orders = [value for value in block_result.get("order_numbers", []) if isinstance(value, str)]
         top_scan_text = normalize_document_text("\n".join(part for part in [top_half_text, working_text, top_text] if part.strip()))
@@ -1189,6 +1305,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             if is_valid_po_number(match.group(0))
         ]
         order_numbers = unique_preserve_order([*block_orders, *top_regex_orders])
+        pdf_order_candidates = order_numbers[:]
         if not order_numbers:
             scan_text = normalize_document_text("\n".join(part for part in [working_text, full_text] if part.strip()))
             regex_orders = [
@@ -1197,8 +1314,16 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                 if is_valid_po_number(match.group(0))
             ]
             order_numbers = unique_preserve_order([*block_orders, *regex_orders])
+            pdf_order_candidates = order_numbers[:]
         filename_orders = extract_po_from_filename(pdf_path.stem)
-        order_numbers, resolved_representative_order = resolve_order_candidates_with_filename(order_numbers, filename_orders)
+        order_numbers, resolved_representative_order, order_decision_reason, similarity_debug = resolve_order_candidates_with_filename(order_numbers, filename_orders)
+
+        debug_log_lines.append(f"[PO후보] block: {', '.join(block_orders) if block_orders else '없음'}")
+        debug_log_lines.append(f"[PO후보] top-text regex: {', '.join(top_regex_orders) if top_regex_orders else '없음'}")
+        debug_log_lines.append(f"[PO후보] full-text regex: {', '.join(pdf_order_candidates) if pdf_order_candidates else '없음'}")
+        debug_log_lines.append(f"[PO후보] filename: {', '.join(filename_orders) if filename_orders else '없음'}")
+        debug_log_lines.append(f"[PO비교] PDF vs filename similarity: {similarity_debug}")
+        debug_log_lines.append(f"[PO결정] {order_decision_reason} -> {resolved_representative_order}")
 
         date_from_blocks = str(block_result.get("document_date", "")).strip()
         if date_from_blocks and normalize_date(date_from_blocks) != MISSING_VALUE:
@@ -1213,23 +1338,17 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             if ocr_text.strip():
                 used_ocr = True
                 merged_top_text = normalize_document_text("\n".join(part for part in [working_text, ocr_text] if part.strip()))
-                detected_company, detected_alias, detected_source, _auto_candidates = detect_company_name(
-                    merged_top_text, company_rules, session_company_memory
-                )
                 if company_name == MISSING_VALUE:
-                    if session_company_memory:
-                        mapped_company, mapped_key = find_company_mapping_in_pdf_text(
-                            session_company_memory,
-                            [merged_top_text, full_text, first_page_blocks_text],
-                        )
-                        if mapped_company:
-                            company_name = mapped_company
-                            matched_alias = mapped_key
-                            company_source = "session-memory-direct"
-                    if company_name == MISSING_VALUE and detected_company != MISSING_VALUE and detected_source == "session-memory":
-                        company_name = detected_company
-                        matched_alias = detected_alias
-                        company_source = detected_source
+                    company_name, matched_alias, company_source, ocr_company_debug = resolve_company_name(
+                        mapping=mapping_source,
+                        top_text=merged_top_text,
+                        full_text=full_text,
+                        first_page_blocks_text=first_page_blocks_text,
+                        block_result=block_result,
+                        ocr_top_text=merged_top_text,
+                    )
+                    debug_log_lines.extend(ocr_company_debug)
+                    company_decision_reason = "OCR top assist" if company_source == "ocr-top-candidate" else company_decision_reason
 
                 merged_scan_text = normalize_document_text("\n".join(part for part in [merged_top_text, full_text] if part.strip()))
                 regex_orders = [
@@ -1238,7 +1357,11 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                     if is_valid_po_number(match.group(0))
                 ]
                 order_numbers = unique_preserve_order([*order_numbers, *regex_orders])
-                order_numbers, resolved_representative_order = resolve_order_candidates_with_filename(order_numbers, filename_orders)
+                pdf_order_candidates = unique_preserve_order([*pdf_order_candidates, *regex_orders])
+                order_numbers, resolved_representative_order, order_decision_reason, similarity_debug = resolve_order_candidates_with_filename(order_numbers, filename_orders)
+                debug_log_lines.append(f"[PO후보][OCR] merged regex: {', '.join(regex_orders) if regex_orders else '없음'}")
+                debug_log_lines.append(f"[PO비교][OCR] PDF vs filename similarity: {similarity_debug}")
+                debug_log_lines.append(f"[PO결정][OCR] {order_decision_reason} -> {resolved_representative_order}")
                 if document_date == MISSING_VALUE:
                     document_date = extract_document_date(merged_top_text, pdf_path.stem)
 
@@ -1249,8 +1372,12 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             order_numbers = [MISSING_VALUE]
         if resolved_representative_order == MISSING_VALUE:
             resolved_representative_order = select_representative_order_number(order_numbers)
+            if order_decision_reason == "ambiguous":
+                order_decision_reason = "block/text primary"
 
         raw_order_candidates = order_numbers[:]
+        debug_log_lines.append(f"[회사명결정-최종] {company_name} ({company_decision_reason})")
+        debug_log_lines.append(f"[PO결정-최종] {resolved_representative_order} ({order_decision_reason})")
 
     representative_order_number = resolved_representative_order
     missing_order_only = (not order_numbers) or (len(order_numbers) == 1 and order_numbers[0] == MISSING_VALUE)
@@ -1274,8 +1401,13 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         used_ocr=used_ocr,
         company_match_status=company_match_status,
         raw_order_candidates=raw_order_candidates,
+        pdf_order_candidates=pdf_order_candidates if 'pdf_order_candidates' in locals() else [],
+        filename_order_candidates=filename_orders if 'filename_orders' in locals() else [],
         matched_alias=matched_alias,
         company_rule_source=company_source if company_name != MISSING_VALUE else "",
+        company_decision_reason=company_decision_reason,
+        order_decision_reason=order_decision_reason if 'order_decision_reason' in locals() else "",
+        debug_log_lines=debug_log_lines,
     )
 
 
@@ -1840,7 +1972,7 @@ class PdfToJpgApp(ctk.CTk):
     def open_edit_dialog(self, document: DocumentInfo) -> None:
         dialog = ctk.CTkToplevel(self)
         dialog.title("행 편집")
-        dialog.geometry("420x260")
+        dialog.geometry("520x390")
         dialog.transient(self)
         dialog.grab_set()
         dialog.grid_columnconfigure(1, weight=1)
@@ -1848,6 +1980,10 @@ class PdfToJpgApp(ctk.CTk):
         company_var = tk.StringVar(value=document.company_name)
         date_var = tk.StringVar(value=document.document_date)
         order_var = tk.StringVar(value=document.representative_order_number)
+        pdf_candidates_var = tk.StringVar(value=", ".join(document.pdf_order_candidates) if document.pdf_order_candidates else MISSING_VALUE)
+        filename_candidates_var = tk.StringVar(
+            value=", ".join(document.filename_order_candidates) if document.filename_order_candidates else MISSING_VALUE
+        )
 
         fields = [
             ("회사명", company_var),
@@ -1861,6 +1997,20 @@ class PdfToJpgApp(ctk.CTk):
             ctk.CTkEntry(dialog, textvariable=variable, height=34).grid(
                 row=index, column=1, padx=(0, 18), pady=(18 if index == 0 else 8, 0), sticky="ew"
             )
+
+        readonly_fields = [
+            ("PDF 추출 후보", pdf_candidates_var),
+            ("파일명 후보", filename_candidates_var),
+        ]
+        base_row = len(fields)
+        for offset, (label_text, variable) in enumerate(readonly_fields):
+            row = base_row + offset
+            ctk.CTkLabel(dialog, text=label_text, font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold")).grid(
+                row=row, column=0, padx=(18, 10), pady=(8, 0), sticky="w"
+            )
+            entry = ctk.CTkEntry(dialog, textvariable=variable, height=34)
+            entry.grid(row=row, column=1, padx=(0, 18), pady=(8, 0), sticky="ew")
+            entry.configure(state="readonly")
 
         def save_edit() -> None:
             previous_candidate = (document.matched_alias or document.company_name).strip()
@@ -1883,7 +2033,7 @@ class PdfToJpgApp(ctk.CTk):
             self.refresh_selection_panel()
 
         button_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        button_row.grid(row=4, column=0, columnspan=2, padx=18, pady=20, sticky="ew")
+        button_row.grid(row=base_row + len(readonly_fields), column=0, columnspan=2, padx=18, pady=20, sticky="ew")
         button_row.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(button_row, text="저장", command=save_edit).grid(row=0, column=0, padx=(0, 8), sticky="ew")
         ctk.CTkButton(button_row, text="취소", command=dialog.destroy, fg_color="#b0a89f", hover_color="#9b938a").grid(
@@ -2439,6 +2589,15 @@ class PdfToJpgApp(ctk.CTk):
                             total_files=total_files,
                         )
                     )
+                    for debug_line in document_info.debug_log_lines:
+                        self.event_queue.put(
+                            ProgressEvent(
+                                event_type="status",
+                                message=f"[디버그] {pdf_path.name} | {debug_line}",
+                                current_file=file_index,
+                                total_files=total_files,
+                            )
+                        )
                 except Exception as error:
                     fail_count += 1
                     self.event_queue.put(
@@ -2770,6 +2929,8 @@ class PdfToJpgApp(ctk.CTk):
             "규칙출처",
             "문서날짜",
             "대표발주번호",
+            "PDF추출후보PO",
+            "파일명후보PO",
             "전체발주번호",
             "상태",
             "페이지수",
@@ -2789,6 +2950,8 @@ class PdfToJpgApp(ctk.CTk):
                         "규칙출처": document.company_rule_source,
                         "문서날짜": document.document_date,
                         "대표발주번호": document.representative_order_number,
+                        "PDF추출후보PO": ", ".join(document.pdf_order_candidates),
+                        "파일명후보PO": ", ".join(document.filename_order_candidates),
                         "전체발주번호": ", ".join(document.order_numbers),
                         "상태": document.status,
                         "페이지수": document.page_count,
