@@ -761,6 +761,67 @@ def is_terms_page(page_text: str) -> bool:
     return len(english_sentence_lines) >= 7 and keyword_hits >= 2 and not has_core_label(text)
 
 
+def is_dense_small_text_page(page: fitz.Page) -> bool:
+    try:
+        page_dict = page.get_text("dict")
+    except Exception:
+        return False
+
+    blocks = page_dict.get("blocks", []) if isinstance(page_dict, dict) else []
+    page_rect = page.rect
+    page_area = max(page_rect.width * page_rect.height, 1.0)
+
+    text_area_sum = 0.0
+    line_texts: List[str] = []
+    font_sizes: List[float] = []
+    total_chars = 0
+
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != 0:
+            continue
+        bbox = block.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x0, y0, x1, y1 = bbox
+            text_area_sum += max((x1 - x0), 0) * max((y1 - y0), 0)
+
+        for line in block.get("lines", []) or []:
+            spans = line.get("spans", []) if isinstance(line, dict) else []
+            line_text = "".join(str(span.get("text", "")) for span in spans if isinstance(span, dict)).strip()
+            if not line_text:
+                continue
+            line_texts.append(line_text)
+            total_chars += len(line_text)
+            for span in spans:
+                if not isinstance(span, dict):
+                    continue
+                size = span.get("size")
+                if isinstance(size, (int, float)):
+                    span_text = str(span.get("text", ""))
+                    repeat = max(len(span_text.strip()), 1)
+                    font_sizes.extend([float(size)] * min(repeat, 12))
+
+    line_count = len(line_texts)
+    if line_count == 0:
+        return False
+
+    avg_line_length = sum(len(line) for line in line_texts) / line_count
+    sentence_like_lines = [
+        line for line in line_texts
+        if (len(line) >= 28 and (line.count(".") + line.count("!") + line.count("?") + line.count("。") >= 1))
+    ]
+    sentence_ratio = len(sentence_like_lines) / max(line_count, 1)
+    avg_font_size = (sum(font_sizes) / len(font_sizes)) if font_sizes else 99.0
+    text_coverage_ratio = text_area_sum / page_area
+
+    is_dense_lines = line_count >= 10
+    is_long_lines = avg_line_length >= 30
+    is_sentence_heavy = sentence_ratio >= 0.35
+    is_small_font = avg_font_size <= 11.0
+    is_text_heavy = text_coverage_ratio >= 0.45 or total_chars >= 700
+
+    return all([is_dense_lines, is_long_lines, is_sentence_heavy, is_small_font, is_text_heavy])
+
+
 def _to_block_dict(block: Tuple) -> Optional[Dict[str, object]]:
     if len(block) < 5:
         return None
@@ -1632,6 +1693,22 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
             page_text = ""
             image: Optional[Image.Image] = None
             final_image: Optional[Image.Image] = None
+
+            if is_dense_small_text_page(page):
+                progress_callback(
+                    ProgressEvent(
+                        event_type="page",
+                        message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
+                        current_file=file_index,
+                        total_files=total_files,
+                        current_page=page_number,
+                        total_pages=total_pages,
+                    )
+                )
+                del page
+                del page_text
+                continue
+
             try:
                 page_text = normalize_document_text(page.get_text())
             except Exception:
@@ -1707,6 +1784,22 @@ def convert_pdf_quick(pdf_path: Path, file_index: int, total_files: int, progres
             page_text = ""
             image: Optional[Image.Image] = None
             final_image: Optional[Image.Image] = None
+
+            if is_dense_small_text_page(page):
+                progress_callback(
+                    ProgressEvent(
+                        event_type="page",
+                        message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
+                        current_file=file_index,
+                        total_files=total_files,
+                        current_page=page_number,
+                        total_pages=total_pages,
+                    )
+                )
+                del page
+                del page_text
+                continue
+
             if skip_terms_pages:
                 try:
                     page_text = normalize_document_text(page.get_text())
