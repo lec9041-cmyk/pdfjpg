@@ -311,6 +311,8 @@ def normalize_document_text(text: str) -> str:
     normalized = text.replace("\r", "\n")
     normalized = re.sub(r"([A-Za-z]{2,}\d{2,})\s*-\s*\n\s*(\d{2,})", r"\1-\2", normalized)
     normalized = re.sub(r"([A-Za-z]{2,}\d{2,})\s*-\s*(\d{2,})", r"\1-\2", normalized)
+    normalized = re.sub(r"(\d{6,})\s*-\s*\n\s*(\d{1,4})", r"\1-\2", normalized)
+    normalized = re.sub(r"(\d{6,})\s*-\s*(\d{1,4})", r"\1-\2", normalized)
     normalized = re.sub(
         r"((?:발주번호|주문번호|수주번호|등록번호|po\s*number|po\s*no\.?|p/o\s*no\.?)\s*[:：#]?)\s*\n+\s*",
         r"\1 ",
@@ -1037,6 +1039,22 @@ def collect_raw_order_candidates(full_text: str, company_rule: Optional[CompanyR
     return unique_preserve_order([value for value in cleaned if is_valid_po_number(value)])
 
 
+def select_representative_order_number(order_numbers: List[str]) -> str:
+    valid_values = [value for value in order_numbers if value and value != MISSING_VALUE]
+    if not valid_values:
+        return MISSING_VALUE
+
+    def score(value: str) -> Tuple[int, int]:
+        cleaned = clean_order_candidate(value)
+        normalized = normalize_for_match(cleaned)
+        has_separator = 1 if ("-" in cleaned or "/" in cleaned) else 0
+        not_full_date = 1 if not is_full_date_token(cleaned) else 0
+        return (has_separator * 3 + not_full_date * 2 + (1 if any(ch.isalpha() for ch in cleaned) else 0), len(normalized))
+
+    best = sorted(valid_values, key=score, reverse=True)[0]
+    return best
+
+
 
 def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_company_memory: Optional[Dict[str, str]] = None) -> DocumentInfo:
     with fitz.open(pdf_path) as document:
@@ -1151,7 +1169,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
 
         raw_order_candidates = order_numbers[:]
 
-    representative_order_number = order_numbers[0] if order_numbers else MISSING_VALUE
+    representative_order_number = select_representative_order_number(order_numbers)
     missing_order_only = (not order_numbers) or (len(order_numbers) == 1 and order_numbers[0] == MISSING_VALUE)
     status = "OCR사용" if used_ocr else ("번호없음" if missing_order_only else "분석완료")
     excerpt = " ".join(full_text.split())[:160]
