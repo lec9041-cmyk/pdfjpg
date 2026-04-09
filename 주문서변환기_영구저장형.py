@@ -1680,6 +1680,7 @@ class PdfToJpgApp(ctk.CTk):
         self.preview_text = tk.StringVar(value="선택한 발주번호가 여기에 표시됩니다.")
         self.filter_mode_var = tk.StringVar(value="전체")
         self.filter_value_var = tk.StringVar(value="전체")
+        self.show_advanced_filter = False
         self.is_left_panel_collapsed = False
         self.session_company_memory: Dict[str, str] = self.load_persistent_company_memory()
         self.company_banned_tokens, self.po_banned_tokens = self.load_banned_tokens()
@@ -1866,19 +1867,19 @@ class PdfToJpgApp(ctk.CTk):
         ctk.CTkLabel(
             self.right_panel,
             text="기안 제목 만들기",
-            font=ctk.CTkFont(family="Malgun Gothic", size=22, weight="bold"),
+            font=ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold"),
             text_color="#40342c",
-        ).grid(row=0, column=0, padx=20, pady=(20, 8), sticky="w")
+        ).grid(row=0, column=0, padx=20, pady=(14, 6), sticky="w")
 
         summary_row = ctk.CTkFrame(self.right_panel, fg_color="transparent")
-        summary_row.grid(row=1, column=0, padx=20, pady=(0, 6), sticky="ew")
+        summary_row.grid(row=1, column=0, padx=20, pady=(0, 4), sticky="ew")
         summary_row.grid_columnconfigure(0, weight=1)
         summary_row.grid_columnconfigure(1, weight=0)
 
         self.summary_label = ctk.CTkLabel(
             summary_row,
             text="분석 전",
-            font=ctk.CTkFont(family="Malgun Gothic", size=14),
+            font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold"),
             text_color="#7b6c61",
             justify="left",
             anchor="w",
@@ -1888,41 +1889,57 @@ class PdfToJpgApp(ctk.CTk):
         self.selection_hint_label = ctk.CTkLabel(
             summary_row,
             text="번호를 체크하면 아래 제목이 바로 만들어집니다.",
-            font=ctk.CTkFont(family="Malgun Gothic", size=12),
+            font=ctk.CTkFont(family="Malgun Gothic", size=11),
             text_color="#9a8b7f",
             anchor="e",
         )
         self.selection_hint_label.grid(row=0, column=1, padx=(8, 0), sticky="e")
 
         filter_row = ctk.CTkFrame(self.right_panel, fg_color="transparent")
-        filter_row.grid(row=2, column=0, padx=20, pady=(0, 8), sticky="ew")
-        filter_row.grid_columnconfigure(1, weight=0)
-        filter_row.grid_columnconfigure(2, weight=1)
+        filter_row.grid(row=2, column=0, padx=20, pady=(0, 6), sticky="ew")
+        filter_row.grid_columnconfigure(0, weight=1)
+
+        self.advanced_filter_toggle_button = ctk.CTkButton(
+            text="고급 필터 열기",
+            command=self.toggle_advanced_filter,
+            width=120,
+            height=28,
+            corner_radius=10,
+            fg_color="#e9ded1",
+            hover_color="#dccdbb",
+            text_color="#6b5d52",
+            font=ctk.CTkFont(family="Malgun Gothic", size=11, weight="bold"),
+        )
+        self.advanced_filter_toggle_button.grid(row=0, column=0, sticky="w")
+
+        self.advanced_filter_frame = ctk.CTkFrame(filter_row, fg_color="transparent")
+        self.advanced_filter_frame.grid_columnconfigure(1, weight=0)
+        self.advanced_filter_frame.grid_columnconfigure(2, weight=1)
 
         ctk.CTkLabel(
-            filter_row,
+            self.advanced_filter_frame,
             text="날짜 필터",
-            font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
+            font=ctk.CTkFont(family="Malgun Gothic", size=11, weight="bold"),
             text_color="#7b6c61",
         ).grid(row=0, column=0, padx=(0, 8), sticky="w")
 
         self.filter_mode_menu = ctk.CTkOptionMenu(
-            filter_row,
+            self.advanced_filter_frame,
             values=["전체", "일간", "주간", "월간"],
             variable=self.filter_mode_var,
             command=self.on_filter_mode_changed,
-            width=110,
-            height=32,
+            width=100,
+            height=28,
         )
         self.filter_mode_menu.grid(row=0, column=1, padx=(0, 8), sticky="w")
 
         self.filter_value_menu = ctk.CTkOptionMenu(
-            filter_row,
+            self.advanced_filter_frame,
             values=["전체"],
             variable=self.filter_value_var,
             command=self.on_filter_value_changed,
-            width=180,
-            height=32,
+            width=170,
+            height=28,
         )
         self.filter_value_menu.grid(row=0, column=2, sticky="w")
 
@@ -1934,11 +1951,11 @@ class PdfToJpgApp(ctk.CTk):
             label_font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold"),
             label_fg_color="#fff6ef",
         )
-        self.selection_frame.grid(row=3, column=0, padx=20, pady=(0, 10), sticky="nsew")
+        self.selection_frame.grid(row=3, column=0, padx=20, pady=(0, 8), sticky="nsew")
         self.selection_frame.grid_columnconfigure(0, weight=1)
 
         preview_frame = ctk.CTkFrame(self.right_panel, fg_color="#fff2e7", corner_radius=18)
-        preview_frame.grid(row=4, column=0, padx=20, pady=(0, 16), sticky="ew")
+        preview_frame.grid(row=4, column=0, padx=20, pady=(0, 12), sticky="ew")
         preview_frame.grid_columnconfigure(0, weight=1)
         preview_frame.grid_columnconfigure(1, weight=0)
         preview_frame.grid_columnconfigure(2, weight=0)
@@ -1950,17 +1967,17 @@ class PdfToJpgApp(ctk.CTk):
             text="복붙용 제목",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
             text_color="#5b4a44",
-        ).grid(row=0, column=0, columnspan=3, padx=14, pady=(10, 3), sticky="w")
+        ).grid(row=0, column=0, columnspan=3, padx=12, pady=(8, 2), sticky="w")
 
         self.preview_entry = ctk.CTkEntry(
             preview_frame,
-            height=40,
+            height=34,
             corner_radius=14,
             fg_color="#fffaf6",
             text_color="#352d29",
             font=ctk.CTkFont(family="Malgun Gothic", size=13),
         )
-        self.preview_entry.grid(row=1, column=0, padx=(14, 10), pady=(0, 10), sticky="ew")
+        self.preview_entry.grid(row=1, column=0, padx=(12, 8), pady=(0, 8), sticky="ew")
         self.preview_entry.insert(0, self.preview_text.get())
         self.preview_entry.configure(state="readonly")
 
@@ -1969,84 +1986,84 @@ class PdfToJpgApp(ctk.CTk):
             text="제목 복사",
             command=self.copy_preview,
             width=120,
-            height=40,
+            height=34,
             corner_radius=14,
             fg_color="#e9a03b",
             hover_color="#d18e2e",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold"),
         )
-        self.copy_button.grid(row=1, column=1, padx=(0, 8), pady=(0, 10), sticky="ew")
+        self.copy_button.grid(row=1, column=1, padx=(0, 6), pady=(0, 8), sticky="ew")
 
         self.clear_button = ctk.CTkButton(
             preview_frame,
             text="초기화",
             command=self.clear_selection,
             width=100,
-            height=40,
+            height=34,
             corner_radius=14,
             fg_color="#c97b63",
             hover_color="#b56750",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold"),
         )
-        self.clear_button.grid(row=1, column=2, padx=(0, 14), pady=(0, 10), sticky="ew")
+        self.clear_button.grid(row=1, column=2, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.memory_export_button = ctk.CTkButton(
             preview_frame,
             text="회사명 기억 복사",
             command=self.export_session_memory,
             width=120,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#7c8db5",
             hover_color="#6c7da2",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.memory_export_button.grid(row=2, column=1, padx=(0, 8), pady=(0, 12), sticky="ew")
+        self.memory_export_button.grid(row=2, column=1, padx=(0, 6), pady=(0, 8), sticky="ew")
 
         self.memory_import_button = ctk.CTkButton(
             preview_frame,
             text="회사명 기억 붙여넣기",
             command=self.open_memory_import_dialog,
             width=140,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#6e9f87",
             hover_color="#5b8b75",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.memory_import_button.grid(row=2, column=2, padx=(0, 14), pady=(0, 12), sticky="ew")
+        self.memory_import_button.grid(row=2, column=2, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.mapping_manage_button = ctk.CTkButton(
             preview_frame,
             text="회사명 매핑 관리",
             command=self.open_company_mapping_manager,
             width=140,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#5f8da8",
             hover_color="#507a93",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.mapping_manage_button.grid(row=2, column=3, padx=(0, 14), pady=(0, 12), sticky="ew")
+        self.mapping_manage_button.grid(row=2, column=3, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.banned_tokens_button = ctk.CTkButton(
             preview_frame,
             text="금지어 관리",
             command=self.open_banned_tokens_manager,
             width=120,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#9c7f64",
             hover_color="#876c53",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.banned_tokens_button.grid(row=2, column=4, padx=(0, 14), pady=(0, 12), sticky="ew")
+        self.banned_tokens_button.grid(row=2, column=4, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.memory_status_label = ctk.CTkLabel(
             preview_frame,
@@ -2058,6 +2075,7 @@ class PdfToJpgApp(ctk.CTk):
         )
         self.memory_status_label.grid(row=2, column=0, padx=(14, 10), pady=(0, 12), sticky="ew")
 
+        self.advanced_filter_frame.grid_remove()
         self._populate_empty_selection_state()
         self.update_memory_status()
 
@@ -2095,6 +2113,15 @@ class PdfToJpgApp(ctk.CTk):
 
     def on_filter_value_changed(self, _choice: str) -> None:
         self.refresh_selection_panel()
+
+    def toggle_advanced_filter(self) -> None:
+        self.show_advanced_filter = not self.show_advanced_filter
+        if self.show_advanced_filter:
+            self.advanced_filter_toggle_button.configure(text="고급 필터 숨기기")
+            self.advanced_filter_frame.grid(row=1, column=0, pady=(4, 0), sticky="ew")
+        else:
+            self.advanced_filter_toggle_button.configure(text="고급 필터 열기")
+            self.advanced_filter_frame.grid_remove()
 
     def get_filter_values(self) -> List[str]:
         dates = sorted({doc.document_date for doc in self.documents if doc.document_date != MISSING_VALUE})
@@ -3060,11 +3087,7 @@ class PdfToJpgApp(ctk.CTk):
 
         elif event.event_type == "summary":
             self.summary_label.configure(
-                text=(
-                    f"총 {event.total_files}개 문서\n"
-                    f"성공 {event.success_count}개\n"
-                    f"실패 {event.fail_count}개"
-                )
+                text=f"문서 {event.total_files} | 성공 {event.success_count} | 실패 {event.fail_count}"
             )
 
         elif event.event_type == "analysis_complete":
@@ -3172,11 +3195,7 @@ class PdfToJpgApp(ctk.CTk):
                 row_index += 1
 
         self.summary_label.configure(
-            text=(
-                f"회사 {total_companies}개\n"
-                f"번호 후보 {total_order_candidates}개\n"
-                f"위 목록에서 바로 체크"
-            )
+            text=f"회사 {total_companies} | 번호 후보 {total_order_candidates}"
         )
 
     def group_documents_by_company(self) -> Dict[str, List[DocumentInfo]]:
