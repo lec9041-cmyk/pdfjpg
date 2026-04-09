@@ -1700,6 +1700,22 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
             page_text = ""
             image: Optional[Image.Image] = None
             final_image: Optional[Image.Image] = None
+
+            if is_dense_small_text_page(page):
+                progress_callback(
+                    ProgressEvent(
+                        event_type="page",
+                        message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
+                        current_file=file_index,
+                        total_files=total_files,
+                        current_page=page_number,
+                        total_pages=total_pages,
+                    )
+                )
+                del page
+                del page_text
+                continue
+
             try:
                 page_text = normalize_document_text(page.get_text())
             except Exception:
@@ -1786,6 +1802,22 @@ def convert_pdf_quick(pdf_path: Path, file_index: int, total_files: int, progres
             page_text = ""
             image: Optional[Image.Image] = None
             final_image: Optional[Image.Image] = None
+
+            if is_dense_small_text_page(page):
+                progress_callback(
+                    ProgressEvent(
+                        event_type="page",
+                        message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
+                        current_file=file_index,
+                        total_files=total_files,
+                        current_page=page_number,
+                        total_pages=total_pages,
+                    )
+                )
+                del page
+                del page_text
+                continue
+
             if skip_terms_pages:
                 try:
                     page_text = normalize_document_text(page.get_text())
