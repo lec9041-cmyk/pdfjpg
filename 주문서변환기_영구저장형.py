@@ -35,6 +35,8 @@ except ImportError:
 
 
 DATE_PATTERN = re.compile(r"(\d{4}[-./]\d{1,2}[-./]\d{1,2}|\d{1,2}[-./]\d{1,2}[-./]\d{4})")
+DATE_COMPACT_YYYYMMDD_PATTERN = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)")
+DATE_COMPACT_YYMMDD_PATTERN = re.compile(r"(?<!\d)(\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)")
 DATE_LABEL_PATTERNS = [
     re.compile(r"(?:발주일|주문일|수주일|po\s*date|release\s*date)\s*[:：]?\s*(\d{4}[-./]\d{1,2}[-./]\d{1,2})", re.IGNORECASE),
     re.compile(r"(?:발주일|주문일|수주일|po\s*date|release\s*date)\s*[:：]?\s*(\d{1,2}[-./]\d{1,2}[-./]\d{4})", re.IGNORECASE),
@@ -367,9 +369,68 @@ def clean_order_candidate(candidate: str) -> str:
 
 def extract_date_from_filename(filename: str) -> str:
     match = DATE_PATTERN.search(filename)
-    if not match:
+    if match:
+        normalized = normalize_date(match.group(1))
+        if normalized != MISSING_VALUE:
+            return normalized
+
+    compact_match = DATE_COMPACT_YYYYMMDD_PATTERN.search(filename)
+    if compact_match:
+        compact = "".join(compact_match.groups())
+        try:
+            parsed = datetime.strptime(compact, "%Y%m%d")
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return MISSING_VALUE
+
+
+def extract_date_from_text_candidates(text: str) -> str:
+    if not text.strip():
         return MISSING_VALUE
-    return normalize_date(match.group(1))
+
+    for pattern in DATE_LABEL_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        normalized = normalize_date(match.group(1))
+        if normalized != MISSING_VALUE:
+            return normalized
+
+    explicit_match = DATE_PATTERN.search(text)
+    if explicit_match:
+        normalized = normalize_date(explicit_match.group(1))
+        if normalized != MISSING_VALUE:
+            return normalized
+
+    compact_match = DATE_COMPACT_YYYYMMDD_PATTERN.search(text)
+    if compact_match:
+        compact = "".join(compact_match.groups())
+        try:
+            parsed = datetime.strptime(compact, "%Y%m%d")
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return MISSING_VALUE
+
+
+def extract_date_from_po_numbers(order_numbers: List[str]) -> str:
+    for order in order_numbers:
+        if not order or order == MISSING_VALUE:
+            continue
+        compact = clean_order_candidate(order).upper()
+        for match in DATE_COMPACT_YYMMDD_PATTERN.finditer(compact):
+            year = int(match.group(1)) + 2000
+            month = int(match.group(2))
+            day = int(match.group(3))
+            if not (2020 <= year <= 2030):
+                continue
+            try:
+                parsed = datetime(year, month, day)
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return MISSING_VALUE
 
 
 def extract_text(document: fitz.Document) -> str:
@@ -625,16 +686,22 @@ def is_valid_po_number(candidate: str) -> bool:
 
 
 def extract_po_from_filename(filename_stem: str) -> List[str]:
-    normalized = filename_stem.replace("_", " ").replace(".", " ").strip()
     candidates: List[str] = []
-    for match in re.finditer(r"[A-Z0-9\-/]{5,20}", normalized.upper()):
-        token = match.group(0).strip("-/")
-        if not token:
+    split_tokens = [token.strip() for token in re.split(r"[\s_\.\(\)\[\]]+", filename_stem) if token.strip()]
+    for token in split_tokens:
+        normalized_token = re.sub(r"[^A-Za-z0-9\-/]", "", token).upper().strip("-/")
+        if not normalized_token:
             continue
-        lowered = token.lower()
+        lowered = normalized_token.lower()
         if any(word in lowered for word in ["shall", "terms", "conditions", "order", "delivery", "acceptance"]):
             continue
-        if is_valid_po_number(token):
+        if is_valid_po_number(normalized_token):
+            candidates.append(clean_order_candidate(normalized_token))
+
+    normalized_text = filename_stem.upper().replace("_", " ").replace(".", " ")
+    for match in re.finditer(r"[A-Z0-9\-/]{5,20}", normalized_text):
+        token = match.group(0).strip("-/")
+        if token and is_valid_po_number(token):
             candidates.append(clean_order_candidate(token))
     return unique_preserve_order(candidates)
 
@@ -1110,14 +1177,24 @@ def resolve_company_name(
     return MISSING_VALUE, "", "", debug_lines
 
 
-def extract_document_date(full_text: str, filename: str) -> str:
-    for pattern in DATE_LABEL_PATTERNS:
-        match = pattern.search(full_text)
-        if match:
-            normalized = normalize_date(match.group(1))
-            if normalized != MISSING_VALUE:
-                return normalized
-    return extract_date_from_filename(filename)
+def extract_document_date(top_text: str, full_text: str, filename: str, order_numbers: List[str]) -> str:
+    top_value = extract_date_from_text_candidates(top_text)
+    if top_value != MISSING_VALUE:
+        return top_value
+
+    full_value = extract_date_from_text_candidates(full_text)
+    if full_value != MISSING_VALUE:
+        return full_value
+
+    filename_value = extract_date_from_filename(filename)
+    if filename_value != MISSING_VALUE:
+        return filename_value
+
+    po_embedded_value = extract_date_from_po_numbers(order_numbers)
+    if po_embedded_value != MISSING_VALUE:
+        return po_embedded_value
+
+    return MISSING_VALUE
 
 
 def unique_preserve_order(values: List[str]) -> List[str]:
@@ -1345,10 +1422,27 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         debug_log_lines.append(f"[PO결정] {order_decision_reason} -> {resolved_representative_order}")
 
         date_from_blocks = str(block_result.get("document_date", "")).strip()
+        date_decision_reason = "missing"
         if date_from_blocks and normalize_date(date_from_blocks) != MISSING_VALUE:
             document_date = normalize_date(date_from_blocks)
+            date_decision_reason = "block label"
         else:
-            document_date = extract_document_date(working_text, pdf_path.stem)
+            document_date = extract_document_date(
+                top_text=top_half_text or top_text or working_text,
+                full_text=full_text,
+                filename=pdf_path.stem,
+                order_numbers=order_numbers,
+            )
+            if extract_date_from_text_candidates(top_half_text or top_text or working_text) != MISSING_VALUE:
+                date_decision_reason = "top text"
+            elif extract_date_from_text_candidates(full_text) != MISSING_VALUE:
+                date_decision_reason = "full text"
+            elif extract_date_from_filename(pdf_path.stem) != MISSING_VALUE:
+                date_decision_reason = "filename"
+            elif extract_date_from_po_numbers(order_numbers) != MISSING_VALUE:
+                date_decision_reason = "po embedded yymmdd"
+            else:
+                date_decision_reason = "확인필요"
 
         needs_ocr = (not text_mode_enough) or company_name == MISSING_VALUE or document_date == MISSING_VALUE or not order_numbers
 
@@ -1382,7 +1476,14 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                 debug_log_lines.append(f"[PO비교][OCR] PDF vs filename similarity: {similarity_debug}")
                 debug_log_lines.append(f"[PO결정][OCR] {order_decision_reason} -> {resolved_representative_order}")
                 if document_date == MISSING_VALUE:
-                    document_date = extract_document_date(merged_top_text, pdf_path.stem)
+                    document_date = extract_document_date(
+                        top_text=merged_top_text,
+                        full_text=full_text,
+                        filename=pdf_path.stem,
+                        order_numbers=order_numbers,
+                    )
+                    if extract_date_from_text_candidates(merged_top_text) != MISSING_VALUE:
+                        date_decision_reason = "ocr top text"
 
         if company_name == MISSING_VALUE:
             company_source = ""
@@ -1397,6 +1498,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         raw_order_candidates = order_numbers[:]
         debug_log_lines.append(f"[회사명결정-최종] {company_name} ({company_decision_reason})")
         debug_log_lines.append(f"[PO결정-최종] {resolved_representative_order} ({order_decision_reason})")
+        debug_log_lines.append(f"[날짜결정-최종] {document_date} ({date_decision_reason})")
 
     representative_order_number = resolved_representative_order
     missing_order_only = (not order_numbers) or (len(order_numbers) == 1 and order_numbers[0] == MISSING_VALUE)
@@ -1448,14 +1550,39 @@ def fit_image_to_canvas(image: Image.Image) -> Image.Image:
     return canvas
 
 
+def build_unique_jpg_name(
+    output_dir: Path,
+    company_name: str,
+    document_date: str,
+    order_number: str,
+    page_number: int,
+    pdf_stem: str,
+) -> str:
+    base_name = f"{company_name}-{document_date}-{order_number}-{page_number}"
+    candidate_name = f"{base_name}.jpg"
+    if not (output_dir / candidate_name).exists():
+        return candidate_name
+
+    stem_token = sanitize_filename_part(pdf_stem)
+    candidate_name = f"{base_name}-{stem_token}.jpg"
+    if not (output_dir / candidate_name).exists():
+        return candidate_name
+
+    duplicate_index = 2
+    while True:
+        candidate_name = f"{base_name}-{stem_token}-{duplicate_index}.jpg"
+        if not (output_dir / candidate_name).exists():
+            return candidate_name
+        duplicate_index += 1
+
+
 def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, progress_callback) -> None:
     pdf_path = document_info.pdf_path
-    output_dir = pdf_path.parent / f"{pdf_path.stem}_jpg"
-    output_dir.mkdir(exist_ok=True)
-
-    company_name = sanitize_filename_part(document_info.company_name)
+    company_name = sanitize_filename_part(document_info.company_name or MISSING_VALUE)
     document_date = sanitize_filename_part(document_info.document_date)
     order_number = sanitize_filename_part(document_info.representative_order_number)
+    output_dir = pdf_path.parent / company_name
+    output_dir.mkdir(exist_ok=True)
 
     with fitz.open(pdf_path) as document:
         total_pages = len(document)
@@ -1503,7 +1630,14 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
 
             image = render_page_to_image(page)
             final_image = fit_image_to_canvas(image)
-            output_name = f"{company_name}-{document_date}-{order_number}-{page_number}.jpg"
+            output_name = build_unique_jpg_name(
+                output_dir=output_dir,
+                company_name=company_name,
+                document_date=document_date,
+                order_number=order_number,
+                page_number=page_number,
+                pdf_stem=pdf_path.stem,
+            )
             final_image.save(output_dir / output_name, "JPEG", quality=95)
 
 
@@ -2348,16 +2482,16 @@ class PdfToJpgApp(ctk.CTk):
         try:
             if not self.banned_tokens_path.exists():
                 payload = {
-                    "company_banned": company_defaults,
-                    "po_banned": po_defaults,
+                    "company_banned_tokens": company_defaults,
+                    "po_banned_tokens": po_defaults,
                 }
                 self.banned_tokens_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 return company_defaults, po_defaults
             loaded = json.loads(self.banned_tokens_path.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 return company_defaults, po_defaults
-            company_tokens = loaded.get("company_banned", [])
-            po_tokens = loaded.get("po_banned", [])
+            company_tokens = loaded.get("company_banned_tokens", loaded.get("company_banned", []))
+            po_tokens = loaded.get("po_banned_tokens", loaded.get("po_banned", []))
             if not isinstance(company_tokens, list):
                 company_tokens = company_defaults
             if not isinstance(po_tokens, list):
@@ -2370,12 +2504,12 @@ class PdfToJpgApp(ctk.CTk):
 
     def save_banned_tokens(self) -> None:
         payload = {
-            "company_banned": sorted({token.strip().lower() for token in self.company_banned_tokens if token.strip()}),
-            "po_banned": sorted({token.strip().lower() for token in self.po_banned_tokens if token.strip()}),
+            "company_banned_tokens": sorted({token.strip().lower() for token in self.company_banned_tokens if token.strip()}),
+            "po_banned_tokens": sorted({token.strip().lower() for token in self.po_banned_tokens if token.strip()}),
         }
         self.banned_tokens_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.company_banned_tokens = payload["company_banned"]
-        self.po_banned_tokens = payload["po_banned"]
+        self.company_banned_tokens = payload["company_banned_tokens"]
+        self.po_banned_tokens = payload["po_banned_tokens"]
         set_banned_tokens(self.company_banned_tokens, self.po_banned_tokens)
 
     def open_banned_tokens_manager(self) -> None:
