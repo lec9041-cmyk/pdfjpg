@@ -87,6 +87,8 @@ RENDER_ZOOM = 2.0
 ANALYSIS_BATCH_SIZE = 20
 CONVERSION_BATCH_SIZE = 10
 EVENTS_PER_TICK = 80
+QUICK_MODE = "빠른 JPG 변환"
+ANALYSIS_MODE = "문서 분석"
 MISSING_VALUE = "확인필요"
 TITLE_PREFIX = "[주문서]"
 TESSERACT_CANDIDATES = [
@@ -1599,6 +1601,21 @@ def build_unique_jpg_name(
         duplicate_index += 1
 
 
+def build_quick_jpg_name(output_dir: Path, pdf_stem: str, page_number: int) -> str:
+    stem_token = sanitize_filename_part(pdf_stem)
+    base_name = f"{stem_token}-{page_number}"
+    candidate_name = f"{base_name}.jpg"
+    if not (output_dir / candidate_name).exists():
+        return candidate_name
+
+    duplicate_index = 2
+    while True:
+        candidate_name = f"{base_name}-{duplicate_index}.jpg"
+        if not (output_dir / candidate_name).exists():
+            return candidate_name
+        duplicate_index += 1
+
+
 def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, progress_callback) -> None:
     pdf_path = document_info.pdf_path
     company_name = sanitize_filename_part(document_info.company_name or MISSING_VALUE)
@@ -1678,6 +1695,70 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
                 del page_text
 
 
+def convert_pdf_quick(pdf_path: Path, file_index: int, total_files: int, progress_callback, skip_terms_pages: bool = True) -> None:
+    output_dir = pdf_path.parent / f"{sanitize_filename_part(pdf_path.stem)}_JPG"
+    output_dir.mkdir(exist_ok=True)
+
+    with fitz.open(pdf_path) as document:
+        total_pages = len(document)
+        for page_index in range(total_pages):
+            page_number = page_index + 1
+            page = document.load_page(page_index)
+            page_text = ""
+            image: Optional[Image.Image] = None
+            final_image: Optional[Image.Image] = None
+            if skip_terms_pages:
+                try:
+                    page_text = normalize_document_text(page.get_text())
+                except Exception:
+                    page_text = ""
+                should_skip_terms = (
+                    page_index >= 1
+                    and bool(page_text.strip())
+                    and is_terms_page(page_text)
+                )
+                if should_skip_terms:
+                    progress_callback(
+                        ProgressEvent(
+                            event_type="page",
+                            message=f"{pdf_path.name} {page_number}/{total_pages} 페이지 약관으로 판단되어 JPG 저장 생략",
+                            current_file=file_index,
+                            total_files=total_files,
+                            current_page=page_number,
+                            total_pages=total_pages,
+                        )
+                    )
+                    del page
+                    del page_text
+                    continue
+
+            progress_callback(
+                ProgressEvent(
+                    event_type="page",
+                    message=f"{pdf_path.name} 빠른 변환 중  |  {page_number}/{total_pages} 페이지",
+                    current_file=file_index,
+                    total_files=total_files,
+                    current_page=page_number,
+                    total_pages=total_pages,
+                )
+            )
+
+            try:
+                image = render_page_to_image(page)
+                final_image = fit_image_to_canvas(image)
+                output_name = build_quick_jpg_name(output_dir=output_dir, pdf_stem=pdf_path.stem, page_number=page_number)
+                final_image.save(output_dir / output_name, "JPEG", quality=95)
+            finally:
+                if final_image is not None:
+                    final_image.close()
+                    del final_image
+                if image is not None:
+                    image.close()
+                    del image
+                del page
+                del page_text
+
+
 class PdfToJpgApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
@@ -1718,6 +1799,7 @@ class PdfToJpgApp(ctk.CTk):
         self.preview_text = tk.StringVar(value="선택한 발주번호가 여기에 표시됩니다.")
         self.filter_mode_var = tk.StringVar(value="전체")
         self.filter_value_var = tk.StringVar(value="전체")
+        self.mode_var = tk.StringVar(value=ANALYSIS_MODE)
         self.show_advanced_filter = False
         self.is_left_panel_collapsed = False
         self.session_company_memory: Dict[str, str] = self.load_persistent_company_memory()
@@ -1758,6 +1840,25 @@ class PdfToJpgApp(ctk.CTk):
             text_color="#5d4a45",
             justify="left",
         ).grid(row=1, column=0, padx=24, pady=(0, 22), sticky="w")
+
+        mode_row = ctk.CTkFrame(hero, fg_color="transparent")
+        mode_row.grid(row=0, column=1, rowspan=2, padx=(0, 24), pady=(18, 18), sticky="e")
+        ctk.CTkLabel(
+            mode_row,
+            text="작업 모드",
+            font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
+            text_color="#5d4a45",
+        ).grid(row=0, column=0, padx=(0, 8), pady=(0, 6), sticky="w")
+        self.mode_selector = ctk.CTkSegmentedButton(
+            mode_row,
+            values=[QUICK_MODE, ANALYSIS_MODE],
+            variable=self.mode_var,
+            command=self.on_mode_changed,
+            height=34,
+            corner_radius=12,
+            font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
+        )
+        self.mode_selector.grid(row=1, column=0, sticky="e")
 
         action_card = ctk.CTkFrame(shell, fg_color="#fffaf6", corner_radius=24)
         action_card.grid(row=1, column=0, columnspan=2, padx=24, pady=(0, 14), sticky="ew")
@@ -1828,6 +1929,7 @@ class PdfToJpgApp(ctk.CTk):
         )
         self.global_toggle_button.grid(row=0, column=6, rowspan=2, padx=(0, 20), pady=18)
         self.setup_drag_and_drop()
+        self.apply_mode_ui()
 
         self.left_panel = ctk.CTkFrame(shell, fg_color="#fffaf6", corner_radius=24)
         self.left_panel.grid(row=2, column=0, padx=(24, 10), pady=(0, 24), sticky="nsew")
@@ -2897,9 +2999,64 @@ class PdfToJpgApp(ctk.CTk):
         self.convert_button.configure(state=state)
         self.export_button.configure(state=state)
         self.banned_tokens_button.configure(state=state)
+        self.mode_selector.configure(state=state)
+        if not is_running:
+            self.apply_mode_ui()
+
+    def is_quick_mode(self) -> bool:
+        return self.mode_var.get() == QUICK_MODE
+
+    def on_mode_changed(self, _mode: str) -> None:
+        if self.is_running:
+            return
+        self.apply_mode_ui()
+
+    def apply_mode_ui(self) -> None:
+        if self.is_quick_mode():
+            self.analyze_button.grid_remove()
+            self.export_button.grid_remove()
+            self.convert_button.configure(text="빠른 JPG 변환")
+            self.info_label.configure(text="폴더/파일 선택 후 바로 빠르게 JPG 변환을 실행합니다. (분석/OCR 생략)")
+            self.summary_label.configure(text="빠른 변환 모드")
+            self.selection_hint_label.configure(text="이 모드에서는 회사/PO 분석을 수행하지 않습니다.")
+            self.selection_frame.configure(label_text="빠른 변환 안내")
+            self.set_detected_text("빠른 JPG 변환 모드: 회사명/PO번호/날짜 분석 없이 변환만 실행됩니다.")
+            self.set_preview_text("빠른 변환 모드에서는 제목 생성을 지원하지 않습니다.")
+            for child in self.selection_frame.winfo_children():
+                child.destroy()
+            ctk.CTkLabel(
+                self.selection_frame,
+                text="빠른 JPG 변환 모드입니다.\n'폴더 선택/파일 선택' 후 '빠른 JPG 변환'만 실행하세요.",
+                justify="left",
+                font=ctk.CTkFont(family="Malgun Gothic", size=13),
+                text_color="#7b6c61",
+            ).grid(row=0, column=0, padx=12, pady=16, sticky="w")
+            self.copy_button.configure(state="disabled")
+            self.clear_button.configure(state="disabled")
+            self.memory_export_button.configure(state="disabled")
+            self.memory_import_button.configure(state="disabled")
+        else:
+            self.analyze_button.grid(row=0, column=3, rowspan=2, padx=6, pady=18)
+            self.export_button.grid(row=0, column=5, rowspan=2, padx=(0, 12), pady=18)
+            self.convert_button.configure(text="JPG 변환")
+            self.info_label.configure(text="폴더를 고르거나 PDF 파일을 끌어다 놓으면, 오른쪽에 회사별 발주번호 목록이 채워집니다.")
+            self.summary_label.configure(text="분석 전" if not self.documents else self.summary_label.cget("text"))
+            self.selection_hint_label.configure(text="번호를 체크하면 아래 제목이 바로 만들어집니다.")
+            self.selection_frame.configure(label_text="회사별 발주번호 목록")
+            self.copy_button.configure(state="normal")
+            self.clear_button.configure(state="normal")
+            self.memory_export_button.configure(state="normal")
+            self.memory_import_button.configure(state="normal")
+            self.refresh_selection_panel()
+            if not self.documents:
+                self.set_detected_text("감지된 회사/발주번호가 여기에 표시됩니다.")
+                self.set_preview_text("선택한 발주번호가 여기에 표시됩니다.")
 
     def start_analysis(self) -> None:
         if self.is_running:
+            return
+        if self.is_quick_mode():
+            messagebox.showinfo("빠른 JPG 변환 모드", "현재는 빠른 JPG 변환 모드입니다.\n문서 분석이 필요하면 '문서 분석' 모드로 전환해주세요.")
             return
         if not self.selected_inputs:
             messagebox.showwarning("선택 필요", "먼저 PDF 파일이나 폴더를 선택해주세요.")
@@ -3042,6 +3199,20 @@ class PdfToJpgApp(ctk.CTk):
     def start_conversion(self) -> None:
         if self.is_running:
             return
+        if self.is_quick_mode():
+            if not self.selected_inputs:
+                messagebox.showwarning("선택 필요", "먼저 PDF 파일이나 폴더를 선택해주세요.")
+                return
+            self.progress_bar.set(0)
+            self.status_label.configure(text="빠른 JPG 변환 준비 중...")
+            self.progress_detail_label.configure(text="PDF 목록 확인 중")
+            self.summary_label.configure(text="빠른 변환 중")
+            self.append_log("[시작] 빠른 JPG 변환을 시작합니다.")
+            self.set_running_state(True)
+            self.worker_thread = threading.Thread(target=self.run_quick_conversion, daemon=True)
+            self.worker_thread.start()
+            return
+
         if not self.documents:
             messagebox.showwarning("분석 필요", "먼저 문서 분석을 완료해주세요.")
             return
@@ -3053,6 +3224,77 @@ class PdfToJpgApp(ctk.CTk):
         self.set_running_state(True)
         self.worker_thread = threading.Thread(target=self.run_conversion, daemon=True)
         self.worker_thread.start()
+
+    def run_quick_conversion(self) -> None:
+        success_count = 0
+        fail_count = 0
+        pdf_files = self.collect_pdf_files()
+        total_files = len(pdf_files)
+
+        if not pdf_files:
+            self.event_queue.put(ProgressEvent(event_type="done", message="선택한 항목에서 PDF 파일을 찾지 못했습니다."))
+            return
+
+        try:
+            for start in range(0, total_files, CONVERSION_BATCH_SIZE):
+                batch_files = pdf_files[start:start + CONVERSION_BATCH_SIZE]
+                batch_end = start + len(batch_files)
+                self.event_queue.put(
+                    ProgressEvent(
+                        event_type="status",
+                        message=f"빠른 변환 배치 처리 중... ({start + 1}-{batch_end}/{total_files})",
+                    )
+                )
+                for offset, pdf_path in enumerate(batch_files, start=1):
+                    file_index = start + offset
+                    try:
+                        convert_pdf_quick(pdf_path, file_index, total_files, self.event_queue.put, skip_terms_pages=True)
+                        success_count += 1
+                        self.event_queue.put(
+                            ProgressEvent(
+                                event_type="status",
+                                message=f"[완료] {pdf_path.name} 빠른 변환 완료",
+                                current_file=file_index,
+                                total_files=total_files,
+                            )
+                        )
+                    except Exception as error:
+                        fail_count += 1
+                        self.event_queue.put(
+                            ProgressEvent(
+                                event_type="status",
+                                message=f"[오류] {pdf_path.name} 빠른 변환 실패: {error}",
+                                current_file=file_index,
+                                total_files=total_files,
+                            )
+                        )
+                    self.event_queue.put(
+                        ProgressEvent(
+                            event_type="summary",
+                            total_files=total_files,
+                            success_count=success_count,
+                            fail_count=fail_count,
+                            current_file=file_index,
+                        )
+                    )
+                gc.collect()
+
+            self.event_queue.put(
+                ProgressEvent(
+                    event_type="done",
+                    message=(
+                        f"빠른 JPG 변환 완료\n"
+                        f"성공: {success_count}개\n"
+                        f"실패: {fail_count}개\n"
+                        f"전체: {total_files}개"
+                    ),
+                    total_files=total_files,
+                    success_count=success_count,
+                    fail_count=fail_count,
+                )
+            )
+        except Exception as error:
+            self.event_queue.put(ProgressEvent(event_type="done", message=f"빠른 변환 중 오류가 발생했습니다: {error}"))
 
     def run_conversion(self) -> None:
         success_count = 0
