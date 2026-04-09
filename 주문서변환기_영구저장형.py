@@ -3,6 +3,7 @@ import difflib
 import json
 import queue
 import re
+import traceback
 import sys
 import threading
 import tkinter as tk
@@ -35,6 +36,8 @@ except ImportError:
 
 
 DATE_PATTERN = re.compile(r"(\d{4}[-./]\d{1,2}[-./]\d{1,2}|\d{1,2}[-./]\d{1,2}[-./]\d{4})")
+DATE_COMPACT_YYYYMMDD_PATTERN = re.compile(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)")
+DATE_COMPACT_YYMMDD_PATTERN = re.compile(r"(?<!\d)(\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)")
 DATE_LABEL_PATTERNS = [
     re.compile(r"(?:발주일|주문일|수주일|po\s*date|release\s*date)\s*[:：]?\s*(\d{4}[-./]\d{1,2}[-./]\d{1,2})", re.IGNORECASE),
     re.compile(r"(?:발주일|주문일|수주일|po\s*date|release\s*date)\s*[:：]?\s*(\d{1,2}[-./]\d{1,2}[-./]\d{4})", re.IGNORECASE),
@@ -367,9 +370,68 @@ def clean_order_candidate(candidate: str) -> str:
 
 def extract_date_from_filename(filename: str) -> str:
     match = DATE_PATTERN.search(filename)
-    if not match:
+    if match:
+        normalized = normalize_date(match.group(1))
+        if normalized != MISSING_VALUE:
+            return normalized
+
+    compact_match = DATE_COMPACT_YYYYMMDD_PATTERN.search(filename)
+    if compact_match:
+        compact = "".join(compact_match.groups())
+        try:
+            parsed = datetime.strptime(compact, "%Y%m%d")
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return MISSING_VALUE
+
+
+def extract_date_from_text_candidates(text: str) -> str:
+    if not text.strip():
         return MISSING_VALUE
-    return normalize_date(match.group(1))
+
+    for pattern in DATE_LABEL_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        normalized = normalize_date(match.group(1))
+        if normalized != MISSING_VALUE:
+            return normalized
+
+    explicit_match = DATE_PATTERN.search(text)
+    if explicit_match:
+        normalized = normalize_date(explicit_match.group(1))
+        if normalized != MISSING_VALUE:
+            return normalized
+
+    compact_match = DATE_COMPACT_YYYYMMDD_PATTERN.search(text)
+    if compact_match:
+        compact = "".join(compact_match.groups())
+        try:
+            parsed = datetime.strptime(compact, "%Y%m%d")
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return MISSING_VALUE
+
+
+def extract_date_from_po_numbers(order_numbers: List[str]) -> str:
+    for order in order_numbers:
+        if not order or order == MISSING_VALUE:
+            continue
+        compact = clean_order_candidate(order).upper()
+        for match in DATE_COMPACT_YYMMDD_PATTERN.finditer(compact):
+            year = int(match.group(1)) + 2000
+            month = int(match.group(2))
+            day = int(match.group(3))
+            if not (2020 <= year <= 2030):
+                continue
+            try:
+                parsed = datetime(year, month, day)
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return MISSING_VALUE
 
 
 def extract_text(document: fitz.Document) -> str:
@@ -625,16 +687,22 @@ def is_valid_po_number(candidate: str) -> bool:
 
 
 def extract_po_from_filename(filename_stem: str) -> List[str]:
-    normalized = filename_stem.replace("_", " ").replace(".", " ").strip()
     candidates: List[str] = []
-    for match in re.finditer(r"[A-Z0-9\-/]{5,20}", normalized.upper()):
-        token = match.group(0).strip("-/")
-        if not token:
+    split_tokens = [token.strip() for token in re.split(r"[\s_\.\(\)\[\]]+", filename_stem) if token.strip()]
+    for token in split_tokens:
+        normalized_token = re.sub(r"[^A-Za-z0-9\-/]", "", token).upper().strip("-/")
+        if not normalized_token:
             continue
-        lowered = token.lower()
+        lowered = normalized_token.lower()
         if any(word in lowered for word in ["shall", "terms", "conditions", "order", "delivery", "acceptance"]):
             continue
-        if is_valid_po_number(token):
+        if is_valid_po_number(normalized_token):
+            candidates.append(clean_order_candidate(normalized_token))
+
+    normalized_text = filename_stem.upper().replace("_", " ").replace(".", " ")
+    for match in re.finditer(r"[A-Z0-9\-/]{5,20}", normalized_text):
+        token = match.group(0).strip("-/")
+        if token and is_valid_po_number(token):
             candidates.append(clean_order_candidate(token))
     return unique_preserve_order(candidates)
 
@@ -1110,14 +1178,24 @@ def resolve_company_name(
     return MISSING_VALUE, "", "", debug_lines
 
 
-def extract_document_date(full_text: str, filename: str) -> str:
-    for pattern in DATE_LABEL_PATTERNS:
-        match = pattern.search(full_text)
-        if match:
-            normalized = normalize_date(match.group(1))
-            if normalized != MISSING_VALUE:
-                return normalized
-    return extract_date_from_filename(filename)
+def extract_document_date(top_text: str, full_text: str, filename: str, order_numbers: List[str]) -> str:
+    top_value = extract_date_from_text_candidates(top_text)
+    if top_value != MISSING_VALUE:
+        return top_value
+
+    full_value = extract_date_from_text_candidates(full_text)
+    if full_value != MISSING_VALUE:
+        return full_value
+
+    filename_value = extract_date_from_filename(filename)
+    if filename_value != MISSING_VALUE:
+        return filename_value
+
+    po_embedded_value = extract_date_from_po_numbers(order_numbers)
+    if po_embedded_value != MISSING_VALUE:
+        return po_embedded_value
+
+    return MISSING_VALUE
 
 
 def unique_preserve_order(values: List[str]) -> List[str]:
@@ -1345,10 +1423,27 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         debug_log_lines.append(f"[PO결정] {order_decision_reason} -> {resolved_representative_order}")
 
         date_from_blocks = str(block_result.get("document_date", "")).strip()
+        date_decision_reason = "missing"
         if date_from_blocks and normalize_date(date_from_blocks) != MISSING_VALUE:
             document_date = normalize_date(date_from_blocks)
+            date_decision_reason = "block label"
         else:
-            document_date = extract_document_date(working_text, pdf_path.stem)
+            document_date = extract_document_date(
+                top_text=top_half_text or top_text or working_text,
+                full_text=full_text,
+                filename=pdf_path.stem,
+                order_numbers=order_numbers,
+            )
+            if extract_date_from_text_candidates(top_half_text or top_text or working_text) != MISSING_VALUE:
+                date_decision_reason = "top text"
+            elif extract_date_from_text_candidates(full_text) != MISSING_VALUE:
+                date_decision_reason = "full text"
+            elif extract_date_from_filename(pdf_path.stem) != MISSING_VALUE:
+                date_decision_reason = "filename"
+            elif extract_date_from_po_numbers(order_numbers) != MISSING_VALUE:
+                date_decision_reason = "po embedded yymmdd"
+            else:
+                date_decision_reason = "확인필요"
 
         needs_ocr = (not text_mode_enough) or company_name == MISSING_VALUE or document_date == MISSING_VALUE or not order_numbers
 
@@ -1382,7 +1477,14 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
                 debug_log_lines.append(f"[PO비교][OCR] PDF vs filename similarity: {similarity_debug}")
                 debug_log_lines.append(f"[PO결정][OCR] {order_decision_reason} -> {resolved_representative_order}")
                 if document_date == MISSING_VALUE:
-                    document_date = extract_document_date(merged_top_text, pdf_path.stem)
+                    document_date = extract_document_date(
+                        top_text=merged_top_text,
+                        full_text=full_text,
+                        filename=pdf_path.stem,
+                        order_numbers=order_numbers,
+                    )
+                    if extract_date_from_text_candidates(merged_top_text) != MISSING_VALUE:
+                        date_decision_reason = "ocr top text"
 
         if company_name == MISSING_VALUE:
             company_source = ""
@@ -1397,6 +1499,7 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
         raw_order_candidates = order_numbers[:]
         debug_log_lines.append(f"[회사명결정-최종] {company_name} ({company_decision_reason})")
         debug_log_lines.append(f"[PO결정-최종] {resolved_representative_order} ({order_decision_reason})")
+        debug_log_lines.append(f"[날짜결정-최종] {document_date} ({date_decision_reason})")
 
     representative_order_number = resolved_representative_order
     missing_order_only = (not order_numbers) or (len(order_numbers) == 1 and order_numbers[0] == MISSING_VALUE)
@@ -1448,14 +1551,39 @@ def fit_image_to_canvas(image: Image.Image) -> Image.Image:
     return canvas
 
 
+def build_unique_jpg_name(
+    output_dir: Path,
+    company_name: str,
+    document_date: str,
+    order_number: str,
+    page_number: int,
+    pdf_stem: str,
+) -> str:
+    base_name = f"{company_name}-{document_date}-{order_number}-{page_number}"
+    candidate_name = f"{base_name}.jpg"
+    if not (output_dir / candidate_name).exists():
+        return candidate_name
+
+    stem_token = sanitize_filename_part(pdf_stem)
+    candidate_name = f"{base_name}-{stem_token}.jpg"
+    if not (output_dir / candidate_name).exists():
+        return candidate_name
+
+    duplicate_index = 2
+    while True:
+        candidate_name = f"{base_name}-{stem_token}-{duplicate_index}.jpg"
+        if not (output_dir / candidate_name).exists():
+            return candidate_name
+        duplicate_index += 1
+
+
 def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, progress_callback) -> None:
     pdf_path = document_info.pdf_path
-    output_dir = pdf_path.parent / f"{pdf_path.stem}_jpg"
-    output_dir.mkdir(exist_ok=True)
-
-    company_name = sanitize_filename_part(document_info.company_name)
+    company_name = sanitize_filename_part(document_info.company_name or MISSING_VALUE)
     document_date = sanitize_filename_part(document_info.document_date)
     order_number = sanitize_filename_part(document_info.representative_order_number)
+    output_dir = pdf_path.parent / company_name
+    output_dir.mkdir(exist_ok=True)
 
     with fitz.open(pdf_path) as document:
         total_pages = len(document)
@@ -1503,7 +1631,14 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
 
             image = render_page_to_image(page)
             final_image = fit_image_to_canvas(image)
-            output_name = f"{company_name}-{document_date}-{order_number}-{page_number}.jpg"
+            output_name = build_unique_jpg_name(
+                output_dir=output_dir,
+                company_name=company_name,
+                document_date=document_date,
+                order_number=order_number,
+                page_number=page_number,
+                pdf_stem=pdf_path.stem,
+            )
             final_image.save(output_dir / output_name, "JPEG", quality=95)
 
 
@@ -1546,6 +1681,7 @@ class PdfToJpgApp(ctk.CTk):
         self.preview_text = tk.StringVar(value="선택한 발주번호가 여기에 표시됩니다.")
         self.filter_mode_var = tk.StringVar(value="전체")
         self.filter_value_var = tk.StringVar(value="전체")
+        self.show_advanced_filter = False
         self.is_left_panel_collapsed = False
         self.session_company_memory: Dict[str, str] = self.load_persistent_company_memory()
         self.company_banned_tokens, self.po_banned_tokens = self.load_banned_tokens()
@@ -1732,19 +1868,19 @@ class PdfToJpgApp(ctk.CTk):
         ctk.CTkLabel(
             self.right_panel,
             text="기안 제목 만들기",
-            font=ctk.CTkFont(family="Malgun Gothic", size=22, weight="bold"),
+            font=ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold"),
             text_color="#40342c",
-        ).grid(row=0, column=0, padx=20, pady=(20, 8), sticky="w")
+        ).grid(row=0, column=0, padx=20, pady=(14, 6), sticky="w")
 
         summary_row = ctk.CTkFrame(self.right_panel, fg_color="transparent")
-        summary_row.grid(row=1, column=0, padx=20, pady=(0, 6), sticky="ew")
+        summary_row.grid(row=1, column=0, padx=20, pady=(0, 4), sticky="ew")
         summary_row.grid_columnconfigure(0, weight=1)
         summary_row.grid_columnconfigure(1, weight=0)
 
         self.summary_label = ctk.CTkLabel(
             summary_row,
             text="분석 전",
-            font=ctk.CTkFont(family="Malgun Gothic", size=14),
+            font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold"),
             text_color="#7b6c61",
             justify="left",
             anchor="w",
@@ -1754,41 +1890,57 @@ class PdfToJpgApp(ctk.CTk):
         self.selection_hint_label = ctk.CTkLabel(
             summary_row,
             text="번호를 체크하면 아래 제목이 바로 만들어집니다.",
-            font=ctk.CTkFont(family="Malgun Gothic", size=12),
+            font=ctk.CTkFont(family="Malgun Gothic", size=11),
             text_color="#9a8b7f",
             anchor="e",
         )
         self.selection_hint_label.grid(row=0, column=1, padx=(8, 0), sticky="e")
 
         filter_row = ctk.CTkFrame(self.right_panel, fg_color="transparent")
-        filter_row.grid(row=2, column=0, padx=20, pady=(0, 8), sticky="ew")
-        filter_row.grid_columnconfigure(1, weight=0)
-        filter_row.grid_columnconfigure(2, weight=1)
+        filter_row.grid(row=2, column=0, padx=20, pady=(0, 6), sticky="ew")
+        filter_row.grid_columnconfigure(0, weight=1)
+
+        self.advanced_filter_toggle_button = ctk.CTkButton(
+            text="고급 필터 열기",
+            command=self.toggle_advanced_filter,
+            width=120,
+            height=28,
+            corner_radius=10,
+            fg_color="#e9ded1",
+            hover_color="#dccdbb",
+            text_color="#6b5d52",
+            font=ctk.CTkFont(family="Malgun Gothic", size=11, weight="bold"),
+        )
+        self.advanced_filter_toggle_button.grid(row=0, column=0, sticky="w")
+
+        self.advanced_filter_frame = ctk.CTkFrame(filter_row, fg_color="transparent")
+        self.advanced_filter_frame.grid_columnconfigure(1, weight=0)
+        self.advanced_filter_frame.grid_columnconfigure(2, weight=1)
 
         ctk.CTkLabel(
-            filter_row,
+            self.advanced_filter_frame,
             text="날짜 필터",
-            font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
+            font=ctk.CTkFont(family="Malgun Gothic", size=11, weight="bold"),
             text_color="#7b6c61",
         ).grid(row=0, column=0, padx=(0, 8), sticky="w")
 
         self.filter_mode_menu = ctk.CTkOptionMenu(
-            filter_row,
+            self.advanced_filter_frame,
             values=["전체", "일간", "주간", "월간"],
             variable=self.filter_mode_var,
             command=self.on_filter_mode_changed,
-            width=110,
-            height=32,
+            width=100,
+            height=28,
         )
         self.filter_mode_menu.grid(row=0, column=1, padx=(0, 8), sticky="w")
 
         self.filter_value_menu = ctk.CTkOptionMenu(
-            filter_row,
+            self.advanced_filter_frame,
             values=["전체"],
             variable=self.filter_value_var,
             command=self.on_filter_value_changed,
-            width=180,
-            height=32,
+            width=170,
+            height=28,
         )
         self.filter_value_menu.grid(row=0, column=2, sticky="w")
 
@@ -1800,11 +1952,11 @@ class PdfToJpgApp(ctk.CTk):
             label_font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold"),
             label_fg_color="#fff6ef",
         )
-        self.selection_frame.grid(row=3, column=0, padx=20, pady=(0, 10), sticky="nsew")
+        self.selection_frame.grid(row=3, column=0, padx=20, pady=(0, 8), sticky="nsew")
         self.selection_frame.grid_columnconfigure(0, weight=1)
 
         preview_frame = ctk.CTkFrame(self.right_panel, fg_color="#fff2e7", corner_radius=18)
-        preview_frame.grid(row=4, column=0, padx=20, pady=(0, 16), sticky="ew")
+        preview_frame.grid(row=4, column=0, padx=20, pady=(0, 12), sticky="ew")
         preview_frame.grid_columnconfigure(0, weight=1)
         preview_frame.grid_columnconfigure(1, weight=0)
         preview_frame.grid_columnconfigure(2, weight=0)
@@ -1816,17 +1968,17 @@ class PdfToJpgApp(ctk.CTk):
             text="복붙용 제목",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
             text_color="#5b4a44",
-        ).grid(row=0, column=0, columnspan=3, padx=14, pady=(10, 3), sticky="w")
+        ).grid(row=0, column=0, columnspan=3, padx=12, pady=(8, 2), sticky="w")
 
         self.preview_entry = ctk.CTkEntry(
             preview_frame,
-            height=40,
+            height=34,
             corner_radius=14,
             fg_color="#fffaf6",
             text_color="#352d29",
             font=ctk.CTkFont(family="Malgun Gothic", size=13),
         )
-        self.preview_entry.grid(row=1, column=0, padx=(14, 10), pady=(0, 10), sticky="ew")
+        self.preview_entry.grid(row=1, column=0, padx=(12, 8), pady=(0, 8), sticky="ew")
         self.preview_entry.insert(0, self.preview_text.get())
         self.preview_entry.configure(state="readonly")
 
@@ -1835,84 +1987,84 @@ class PdfToJpgApp(ctk.CTk):
             text="제목 복사",
             command=self.copy_preview,
             width=120,
-            height=40,
+            height=34,
             corner_radius=14,
             fg_color="#e9a03b",
             hover_color="#d18e2e",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold"),
         )
-        self.copy_button.grid(row=1, column=1, padx=(0, 8), pady=(0, 10), sticky="ew")
+        self.copy_button.grid(row=1, column=1, padx=(0, 6), pady=(0, 8), sticky="ew")
 
         self.clear_button = ctk.CTkButton(
             preview_frame,
             text="초기화",
             command=self.clear_selection,
             width=100,
-            height=40,
+            height=34,
             corner_radius=14,
             fg_color="#c97b63",
             hover_color="#b56750",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="bold"),
         )
-        self.clear_button.grid(row=1, column=2, padx=(0, 14), pady=(0, 10), sticky="ew")
+        self.clear_button.grid(row=1, column=2, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.memory_export_button = ctk.CTkButton(
             preview_frame,
             text="회사명 기억 복사",
             command=self.export_session_memory,
             width=120,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#7c8db5",
             hover_color="#6c7da2",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.memory_export_button.grid(row=2, column=1, padx=(0, 8), pady=(0, 12), sticky="ew")
+        self.memory_export_button.grid(row=2, column=1, padx=(0, 6), pady=(0, 8), sticky="ew")
 
         self.memory_import_button = ctk.CTkButton(
             preview_frame,
             text="회사명 기억 붙여넣기",
             command=self.open_memory_import_dialog,
             width=140,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#6e9f87",
             hover_color="#5b8b75",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.memory_import_button.grid(row=2, column=2, padx=(0, 14), pady=(0, 12), sticky="ew")
+        self.memory_import_button.grid(row=2, column=2, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.mapping_manage_button = ctk.CTkButton(
             preview_frame,
             text="회사명 매핑 관리",
             command=self.open_company_mapping_manager,
             width=140,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#5f8da8",
             hover_color="#507a93",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.mapping_manage_button.grid(row=2, column=3, padx=(0, 14), pady=(0, 12), sticky="ew")
+        self.mapping_manage_button.grid(row=2, column=3, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.banned_tokens_button = ctk.CTkButton(
             preview_frame,
             text="금지어 관리",
             command=self.open_banned_tokens_manager,
             width=120,
-            height=34,
+            height=30,
             corner_radius=14,
             fg_color="#9c7f64",
             hover_color="#876c53",
             text_color="#fffaf6",
             font=ctk.CTkFont(family="Malgun Gothic", size=12, weight="bold"),
         )
-        self.banned_tokens_button.grid(row=2, column=4, padx=(0, 14), pady=(0, 12), sticky="ew")
+        self.banned_tokens_button.grid(row=2, column=4, padx=(0, 12), pady=(0, 8), sticky="ew")
 
         self.memory_status_label = ctk.CTkLabel(
             preview_frame,
@@ -1924,6 +2076,7 @@ class PdfToJpgApp(ctk.CTk):
         )
         self.memory_status_label.grid(row=2, column=0, padx=(14, 10), pady=(0, 12), sticky="ew")
 
+        self.advanced_filter_frame.grid_remove()
         self._populate_empty_selection_state()
         self.update_memory_status()
 
@@ -1961,6 +2114,15 @@ class PdfToJpgApp(ctk.CTk):
 
     def on_filter_value_changed(self, _choice: str) -> None:
         self.refresh_selection_panel()
+
+    def toggle_advanced_filter(self) -> None:
+        self.show_advanced_filter = not self.show_advanced_filter
+        if self.show_advanced_filter:
+            self.advanced_filter_toggle_button.configure(text="고급 필터 숨기기")
+            self.advanced_filter_frame.grid(row=1, column=0, pady=(4, 0), sticky="ew")
+        else:
+            self.advanced_filter_toggle_button.configure(text="고급 필터 열기")
+            self.advanced_filter_frame.grid_remove()
 
     def get_filter_values(self) -> List[str]:
         dates = sorted({doc.document_date for doc in self.documents if doc.document_date != MISSING_VALUE})
@@ -2348,16 +2510,16 @@ class PdfToJpgApp(ctk.CTk):
         try:
             if not self.banned_tokens_path.exists():
                 payload = {
-                    "company_banned": company_defaults,
-                    "po_banned": po_defaults,
+                    "company_banned_tokens": company_defaults,
+                    "po_banned_tokens": po_defaults,
                 }
                 self.banned_tokens_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 return company_defaults, po_defaults
             loaded = json.loads(self.banned_tokens_path.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 return company_defaults, po_defaults
-            company_tokens = loaded.get("company_banned", [])
-            po_tokens = loaded.get("po_banned", [])
+            company_tokens = loaded.get("company_banned_tokens", loaded.get("company_banned", []))
+            po_tokens = loaded.get("po_banned_tokens", loaded.get("po_banned", []))
             if not isinstance(company_tokens, list):
                 company_tokens = company_defaults
             if not isinstance(po_tokens, list):
@@ -2370,12 +2532,12 @@ class PdfToJpgApp(ctk.CTk):
 
     def save_banned_tokens(self) -> None:
         payload = {
-            "company_banned": sorted({token.strip().lower() for token in self.company_banned_tokens if token.strip()}),
-            "po_banned": sorted({token.strip().lower() for token in self.po_banned_tokens if token.strip()}),
+            "company_banned_tokens": sorted({token.strip().lower() for token in self.company_banned_tokens if token.strip()}),
+            "po_banned_tokens": sorted({token.strip().lower() for token in self.po_banned_tokens if token.strip()}),
         }
         self.banned_tokens_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.company_banned_tokens = payload["company_banned"]
-        self.po_banned_tokens = payload["po_banned"]
+        self.company_banned_tokens = payload["company_banned_tokens"]
+        self.po_banned_tokens = payload["po_banned_tokens"]
         set_banned_tokens(self.company_banned_tokens, self.po_banned_tokens)
 
     def open_banned_tokens_manager(self) -> None:
@@ -2926,11 +3088,7 @@ class PdfToJpgApp(ctk.CTk):
 
         elif event.event_type == "summary":
             self.summary_label.configure(
-                text=(
-                    f"총 {event.total_files}개 문서\n"
-                    f"성공 {event.success_count}개\n"
-                    f"실패 {event.fail_count}개"
-                )
+                text=f"문서 {event.total_files} | 성공 {event.success_count} | 실패 {event.fail_count}"
             )
 
         elif event.event_type == "analysis_complete":
@@ -3038,11 +3196,7 @@ class PdfToJpgApp(ctk.CTk):
                 row_index += 1
 
         self.summary_label.configure(
-            text=(
-                f"회사 {total_companies}개\n"
-                f"번호 후보 {total_order_candidates}개\n"
-                f"위 목록에서 바로 체크"
-            )
+            text=f"회사 {total_companies} | 번호 후보 {total_order_candidates}"
         )
 
     def group_documents_by_company(self) -> Dict[str, List[DocumentInfo]]:
@@ -3186,3 +3340,13 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(1)
+    except Exception as error:
+        error_path = Path(__file__).resolve().parent / "startup_error.log"
+        details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        try:
+            error_path.write_text(details, encoding="utf-8")
+        except Exception:
+            pass
+        print(f"[오류] 앱 시작 실패: {error}")
+        print(f"[오류] 상세 로그: {error_path}")
+        raise
