@@ -711,6 +711,7 @@ def get_nearby_value(label_block: Dict[str, object], blocks: List[Dict[str, obje
 
 def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
     rect = page.rect
+    top_half_y_limit = rect.y0 + rect.height * 0.5
     blocks_raw = page.get_text("blocks")
     blocks: List[Dict[str, object]] = []
     for block in blocks_raw:
@@ -868,9 +869,10 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
             company_value = group[0][1]
         break
 
-    po_label = find_label_block(blocks, po_label_patterns)
+    top_half_blocks = [block for block in blocks if float(block["y0"]) <= top_half_y_limit]
+    po_label = find_label_block(top_half_blocks, po_label_patterns)
     if po_label is not None:
-        nearby_primary = get_nearby_value(po_label, blocks)
+        nearby_primary = get_nearby_value(po_label, top_half_blocks)
         if nearby_primary:
             for match in PO_CODE_PATTERN.findall(nearby_primary):
                 if is_valid_po_number(match):
@@ -882,7 +884,7 @@ def extract_from_blocks(page: fitz.Page) -> Dict[str, object]:
         py1 = float(po_label["y1"])
         around.extend(
             str(block["text"]).strip()
-            for block in blocks
+            for block in top_half_blocks
             if block is not po_label
             and float(block["x0"]) >= px0 - 20
             and float(block["x0"]) <= px0 + 520
@@ -1064,15 +1066,21 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
 
         first_page = document.load_page(0) if page_count else None
         top_text = ""
+        top_half_text = ""
         first_page_blocks_text = ""
         block_result: Dict[str, object] = {"company_name": "", "order_numbers": [], "document_date": ""}
         if first_page is not None:
             rect = first_page.rect
             clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.4)
+            top_half_clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * 0.5)
             try:
                 top_text = normalize_document_text(first_page.get_text(clip=clip))
             except Exception:
                 top_text = ""
+            try:
+                top_half_text = normalize_document_text(first_page.get_text(clip=top_half_clip))
+            except Exception:
+                top_half_text = top_text
             try:
                 raw_blocks = first_page.get_text("blocks")
                 first_page_blocks_text = normalize_document_text(
@@ -1111,9 +1119,21 @@ def analyze_pdf(pdf_path: Path, company_rules: List[CompanyRule], session_compan
             company_source = ""
 
         block_orders = [value for value in block_result.get("order_numbers", []) if isinstance(value, str)]
-        scan_text = normalize_document_text("\n".join(part for part in [working_text, full_text] if part.strip()))
-        regex_orders = [clean_order_candidate(match.group(0)) for match in PO_CODE_PATTERN.finditer(scan_text) if is_valid_po_number(match.group(0))]
-        order_numbers = unique_preserve_order([*block_orders, *regex_orders])
+        top_scan_text = normalize_document_text("\n".join(part for part in [top_half_text, working_text, top_text] if part.strip()))
+        top_regex_orders = [
+            clean_order_candidate(match.group(0))
+            for match in PO_CODE_PATTERN.finditer(top_scan_text)
+            if is_valid_po_number(match.group(0))
+        ]
+        order_numbers = unique_preserve_order([*block_orders, *top_regex_orders])
+        if not order_numbers:
+            scan_text = normalize_document_text("\n".join(part for part in [working_text, full_text] if part.strip()))
+            regex_orders = [
+                clean_order_candidate(match.group(0))
+                for match in PO_CODE_PATTERN.finditer(scan_text)
+                if is_valid_po_number(match.group(0))
+            ]
+            order_numbers = unique_preserve_order([*block_orders, *regex_orders])
         filename_orders = extract_po_from_filename(pdf_path.stem)
         if not order_numbers and filename_orders:
             order_numbers = filename_orders[:]
