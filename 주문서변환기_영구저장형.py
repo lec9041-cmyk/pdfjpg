@@ -3,6 +3,7 @@ import difflib
 import json
 import queue
 import re
+import traceback
 import sys
 import threading
 import tkinter as tk
@@ -3339,3 +3340,13 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(1)
+    except Exception as error:
+        error_path = Path(__file__).resolve().parent / "startup_error.log"
+        details = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        try:
+            error_path.write_text(details, encoding="utf-8")
+        except Exception:
+            pass
+        print(f"[오류] 앱 시작 실패: {error}")
+        print(f"[오류] 상세 로그: {error_path}")
+        raise
