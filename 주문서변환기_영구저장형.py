@@ -3666,7 +3666,7 @@ class PdfToJpgApp(ctk.CTk):
         if document.document_date and document.document_date != MISSING_VALUE:
             try:
                 parsed = datetime.strptime(document.document_date, "%Y-%m-%d")
-                return 0, -parsed.toordinal(), filename_key
+                return 0, parsed.toordinal(), filename_key
             except ValueError:
                 pass
         return 1, 0, filename_key
