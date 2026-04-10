@@ -3666,7 +3666,19 @@ class PdfToJpgApp(ctk.CTk):
         grouped: Dict[str, List[DocumentInfo]] = {}
         for document in self.get_filtered_documents():
             grouped.setdefault(document.company_name, []).append(document)
+        for company_name, docs in grouped.items():
+            grouped[company_name] = sorted(docs, key=self.get_document_sort_key)
         return dict(sorted(grouped.items(), key=lambda item: item[0]))
+
+    def get_document_sort_key(self, document: DocumentInfo) -> Tuple[int, int, str]:
+        filename_key = document.pdf_path.name.lower()
+        if document.document_date and document.document_date != MISSING_VALUE:
+            try:
+                parsed = datetime.strptime(document.document_date, "%Y-%m-%d")
+                return 0, -parsed.toordinal(), filename_key
+            except ValueError:
+                pass
+        return 1, 0, filename_key
 
     def on_selection_changed(self, current_key: str) -> None:
         company_name, _order_number = self.selection_meta[current_key]
