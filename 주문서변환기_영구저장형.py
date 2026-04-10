@@ -829,6 +829,30 @@ def is_dense_small_text_page(page: fitz.Page) -> bool:
     )
 
 
+def extract_top_region_text(page: fitz.Page, ratio: float = 0.62) -> str:
+    try:
+        clipped_rect = fitz.Rect(page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y0 + (page.rect.height * ratio))
+        return normalize_document_text(page.get_text("text", clip=clipped_rect))
+    except Exception:
+        return ""
+
+
+def should_skip_jpg_page(page: fitz.Page, page_text: str) -> Tuple[bool, str]:
+    full_text = page_text or ""
+    top_text = extract_top_region_text(page)
+    top_has_core_label = has_core_label(top_text)
+
+    full_terms_page = bool(full_text.strip()) and is_terms_page(full_text)
+    top_terms_page = bool(top_text.strip()) and is_terms_page(top_text)
+    dense_page = is_dense_small_text_page(page)
+
+    if full_terms_page and (top_terms_page or not top_has_core_label):
+        return True, "terms"
+    if dense_page and not top_has_core_label and not has_core_label(full_text):
+        return True, "dense"
+    return False, ""
+
+
 def _to_block_dict(block: Tuple) -> Optional[Dict[str, object]]:
     if len(block) < 5:
         return None
@@ -1701,29 +1725,12 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
             image: Optional[Image.Image] = None
             final_image: Optional[Image.Image] = None
 
-            if is_dense_small_text_page(page):
-                progress_callback(
-                    ProgressEvent(
-                        event_type="page",
-                        message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
-                        current_file=file_index,
-                        total_files=total_files,
-                        current_page=page_number,
-                        total_pages=total_pages,
-                    )
-                )
-                del page
-                del page_text
-                continue
-
             try:
                 page_text = normalize_document_text(page.get_text())
             except Exception:
                 page_text = ""
-            should_skip_terms = bool(page_text.strip()) and is_terms_page(page_text)
-            should_skip_dense_text = is_dense_small_text_page(page)
-
-            if should_skip_terms:
+            should_skip, skip_reason = should_skip_jpg_page(page, page_text)
+            if should_skip and skip_reason == "terms":
                 progress_callback(
                     ProgressEvent(
                         event_type="page",
@@ -1737,7 +1744,7 @@ def convert_pdf(document_info: DocumentInfo, file_index: int, total_files: int, 
                 del page
                 del page_text
                 continue
-            if should_skip_dense_text:
+            if should_skip and skip_reason == "dense":
                 progress_callback(
                     ProgressEvent(
                         event_type="page",
@@ -1803,29 +1810,13 @@ def convert_pdf_quick(pdf_path: Path, file_index: int, total_files: int, progres
             image: Optional[Image.Image] = None
             final_image: Optional[Image.Image] = None
 
-            if is_dense_small_text_page(page):
-                progress_callback(
-                    ProgressEvent(
-                        event_type="page",
-                        message=f"{pdf_path.name} {page_number}/{total_pages} Dense text page detected → skipped",
-                        current_file=file_index,
-                        total_files=total_files,
-                        current_page=page_number,
-                        total_pages=total_pages,
-                    )
-                )
-                del page
-                del page_text
-                continue
-
             if skip_terms_pages:
                 try:
                     page_text = normalize_document_text(page.get_text())
                 except Exception:
                     page_text = ""
-                should_skip_terms = bool(page_text.strip()) and is_terms_page(page_text)
-                should_skip_dense_text = is_dense_small_text_page(page)
-                if should_skip_terms:
+                should_skip, skip_reason = should_skip_jpg_page(page, page_text)
+                if should_skip and skip_reason == "terms":
                     progress_callback(
                         ProgressEvent(
                             event_type="page",
@@ -1839,7 +1830,7 @@ def convert_pdf_quick(pdf_path: Path, file_index: int, total_files: int, progres
                     del page
                     del page_text
                     continue
-                if should_skip_dense_text:
+                if should_skip and skip_reason == "dense":
                     progress_callback(
                         ProgressEvent(
                             event_type="page",
